@@ -31,6 +31,7 @@ from transformers import (
 )
 
 import deepspeed
+from deepspeed.accelerator import get_accelerator
 
 from ppo_trainer import DeepSpeedPPOTrainer, DeepSpeedPPOTrainerUnsupervised
 from rlhf_engine import DeepSpeedRLHFEngine
@@ -410,10 +411,10 @@ def main():
     args = parse_args()
 
     if args.local_rank == -1:
-        device = torch.device("cuda")
+        device = torch.device(get_accelerator().device_name())
     else:
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+        get_accelerator().set_device(args.local_rank)
+        device = torch.device(get_accelerator().device_name(), args.local_rank)
         # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         deepspeed.init_distributed()
 

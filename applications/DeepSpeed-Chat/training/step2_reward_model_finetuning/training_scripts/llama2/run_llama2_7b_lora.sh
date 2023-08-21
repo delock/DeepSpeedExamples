@@ -13,7 +13,7 @@ if [ "$ZERO_STAGE" == "" ]; then
 fi
 mkdir -p $OUTPUT
 
-deepspeed main.py \
+deepspeed --bind_cores_to_rank main.py \
    --data_path Dahoas/rm-static \
    --data_split 2,4,4 \
    --model_name_or_path meta-llama/Llama-2-7b-hf \

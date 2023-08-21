@@ -9,6 +9,7 @@ import numpy as np
 from transformers import set_seed, AutoTokenizer
 import json
 import deepspeed
+from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 import torch.nn as nn
 
@@ -102,7 +103,7 @@ def set_random_seed(seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        get_accelerator().manual_seed_all(seed)
 
 
 def get_all_reduce_mean(tensor):

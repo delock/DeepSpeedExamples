@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import sys
 import os
 import deepspeed
+from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 sys.path.append(
@@ -17,7 +18,7 @@ from utils.utils import print_rank_0
 
 def print_all_ranks(tag, value, rank):
     world_size = torch.distributed.get_world_size()
-    all_tensor = torch.zeros(world_size, dtype=torch.float32).cuda()
+    all_tensor = torch.zeros(world_size, dtype=torch.float32).to(get_accelerator().device_name())
     all_tensor[rank] = value
     torch.distributed.all_reduce(all_tensor, op=torch.distributed.ReduceOp.SUM)
     print_rank_0(f'{tag} {all_tensor}', rank)

@@ -19,7 +19,7 @@ Critic_Lr=5e-6
 
 mkdir -p $OUTPUT
 
-deepspeed --num_gpus 1 main.py \
+deepspeed --num_gpus 1 --bind_cores_to_rank main.py \
    --data_path Dahoas/rm-static \
    --data_split 2,4,4 \
    --actor_model_name_or_path $ACTOR_MODEL_PATH \

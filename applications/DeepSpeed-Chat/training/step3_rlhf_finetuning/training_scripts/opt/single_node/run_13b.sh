@@ -24,7 +24,7 @@ Num_Padding_at_Beginning=1 # this is model related
 Actor_Lr=5e-4
 Critic_Lr=5e-6
 
-deepspeed --master_port 12346 main.py \
+deepspeed --master_port 12346 --bind_cores_to_rank main.py \
    --data_path Dahoas/rm-static \
    --data_split 2,4,4 \
    --actor_model_name_or_path $ACTOR_MODEL_PATH \

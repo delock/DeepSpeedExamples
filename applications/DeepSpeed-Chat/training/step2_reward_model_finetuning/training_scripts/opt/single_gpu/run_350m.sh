@@ -13,7 +13,7 @@ if [ "$ZERO_STAGE" == "" ]; then
 fi
 mkdir -p $OUTPUT
 
-deepspeed --num_gpus 1 main.py --model_name_or_path facebook/opt-350m \
+deepspeed --num_gpus 1 --bind_cores_to_rank main.py --model_name_or_path facebook/opt-350m \
    --num_padding_at_beginning 1 --weight_decay 0.1 --disable_dropout --gradient_accumulation_steps 4 --zero_stage $ZERO_STAGE \
    --enable_tensorboard \
    --tensorboard_path $OUTPUT \

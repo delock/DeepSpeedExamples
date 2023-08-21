@@ -16,7 +16,7 @@ mkdir -p $OUTPUT
 # The Japanese data we found mostly only contain one response without another
 # "rejected" response. Thus we only test the step 1 finetuning and use
 # a data_split of 10,0,0 (keep all data for step 1).
-deepspeed main.py \
+deepspeed --bind_cores_to_rank main.py \
    --data_path mkqa-Japanese Cohere/miracl-ja-queries-22-12 lmqg/qg_jaquad lmqg/qag_jaquad \
    --data_split 10,0,0 \
    --model_name_or_path sberbank-ai/mGPT \

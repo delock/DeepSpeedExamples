@@ -94,6 +94,13 @@ def parse_args():
         choices=("single_gpu", "single_node", "multi_node"),
         help="Number of GPUs to run the actor/reward models on",
     )
+    parser.add_argument(
+        "--data-type",
+        type=str,
+        default="",
+        choices=("fp16", "bf16"),
+        help="Datatype used for training",
+    )
     args = parser.parse_args()
 
     if args.actor_zero_stage != "" or args.reward_zero_stage != "":
