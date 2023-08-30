@@ -42,6 +42,8 @@ from transformers import (
     XLNetTokenizer,
 )
 
+from deepspeed.accelerator import get_accelerator
+
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -81,7 +83,7 @@ def set_seed(args):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
-        torch.cuda.manual_seed_all(args.seed)
+        get_accelerator().manual_seed_all(args.seed)
 
 
 def prepare_ctrl_input(args, _, tokenizer, prompt_text):
@@ -218,22 +220,19 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
     parser.add_argument("--no_cuda", action="store_true", help="Avoid using CUDA when available")
     parser.add_argument("--num_return_sequences", type=int, default=1, help="The number of samples to generate.")
-    parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
-    )
+    parser.add_argument("--dtype", type=str, default='fp32', help="Datatype used for generation")
     parser.add_argument('--ds-inference', action="store_true", help="Use deepspeed")
+    parser.add_argument('--kernel-inject', action="store_true", help="Use deepspeed")
     args = parser.parse_args()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
 
     logger.warning(
-        "device: %s, n_gpu: %s, 16-bits training: %s",
+        "device: %s, n_gpu: %s, data type: %s",
         args.device,
         args.n_gpu,
-        args.fp16,
+        args.dtype,
     )
 
     set_seed(args)
@@ -247,22 +246,29 @@ def main():
 
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
     model = model_class.from_pretrained(args.model_name_or_path)
-    model.cuda(torch.cuda.current_device())
+    model.to(get_accelerator().current_device_name())
 
-    if args.fp16:
+    if args.dtype == 'fp16':
         model.half()
+
+    if args.dtype == 'fp16':
+        dtype = torch.half
+    elif args.dtype == 'bf16':
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
 
     # intialize deepspeed engine
     if args.ds_inference:
         import deepspeed.module_inject as module_inject
         import deepspeed
         injection_policy={gpt2_transformer:
-                          module_inject.replace_policy.HFGPT2LayerPolicy}
+                          module_inject.replace_policy.HFGPT2LayerPolicy} if args.kernel_inject else None
         model = deepspeed.init_inference(model,
                                          mp_size=1,
-                                         dtype=(torch.half if args.fp16 else torch.float),
+                                         dtype=dtype,
                                          injection_policy=injection_policy,
-                                         replace_with_kernel_inject=True)
+                                         replace_with_kernel_inject=args.kernel_inject)
         model = model.module
 
     args.length = adjust_length_to_model(args.length, max_sequence_length=model.config.max_position_embeddings)
@@ -303,7 +309,7 @@ def main():
         else:
             input_ids = encoded_prompt
 
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         t0 = time.time()
 
         output_sequences = model.generate(
@@ -316,7 +322,7 @@ def main():
             do_sample=True,
             num_return_sequences=args.num_return_sequences,
         )
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         latencies.append((time.time()-t0) / output_sequences.numel())
 
         # Remove the batch dimension when returning multiple sequences
