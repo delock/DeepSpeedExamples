@@ -52,7 +52,14 @@ else:
                                     save_mp_checkpoint_path=args.save_mp_checkpoint_path,
                                     **ds_kwargs
                                     )
-  
+    if args.local_rank == 0:
+        print('before compile')
+        print(pipe.model)
+    pipe.model = torch.compile(pipe.model)
+    if args.local_rank == 0:
+        print('after compile')
+        print(pipe.model)
+
 if args.local_rank == 0:
     see_memory_usage("after init_inference", True)
 
