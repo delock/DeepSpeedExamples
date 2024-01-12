@@ -85,7 +85,7 @@ for prompt in inputs:
     base_out_list += pipe(prompt, do_sample=False, min_length=args.min_length, max_length=args.max_length)
 
 # Initialize the model with DeepSpeed
-pipe.model = deepspeed.init_inference(pipe.model, dtype=data_type, replace_with_kernel_inject=True)
+pipe.model = deepspeed.init_inference(pipe.model, dtype=data_type, replace_with_kernel_inject=False)
 
 # Run the DeepSpeed model and compare outputs
 for prompt, base_out in zip(inputs, base_out_list):
