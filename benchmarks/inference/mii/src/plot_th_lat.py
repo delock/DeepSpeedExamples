@@ -40,7 +40,7 @@ def extract_values(file_pattern):
         prof_args, response_details = read_json(f)
         summary = get_summary(prof_args, response_details)
         clients.append(prof_args["num_clients"])
-        throughputs.append(summary.throughput)
+        throughputs.append(summary.tokens_per_sec)
         latencies.append(summary.latency)
 
     return clients, throughputs, latencies, prof_args
@@ -152,7 +152,7 @@ def output_charts(model, tp_size, bs, replicas, prompt, gen, out_dir):
         model_label = model
 
     plt.title(f"Model: {model_label}, Prompt: {prompt}, Generation: {gen}, TP: {tp_size}")
-    plt.xlabel("Throughput (queries/s)", fontsize=14)
+    plt.xlabel("Throughput (tokens/s)", fontsize=14)
     plt.ylabel("Latency (s)", fontsize=14)
     plt.legend()
     plt.grid(True)
