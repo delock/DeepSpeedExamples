@@ -1,0 +1,173 @@
+# dschat 改造计划：SFT + GRPO，推训一体化（v2）
+
+## Phase 1: GRPO Trainer（独立于 placement 优化）
+
+> 目标：能跑通 SFT + GRPO，功能正确
+
+### Step 1.1 — 简化 RLHF Engine
+- 移除 `critic`、`reward`、`ema` 模型初始化
+- 只保留 `actor` 和 `ref`
+- `rlhf_engine.py` 大幅瘦身
+- 验证：SFT step 能正常跑
+
+### Step 1.2 — 实现 GRPO Trainer
+- 新建 `grpo_trainer.py`，替换 `ppo_trainer.py`
+- 核心循环：generate experience → compute rule-based reward → compute group-relative advantage → actor backward/step
+- 移除所有 PPO 特有逻辑（clip, value model, GAE）
+- reward 接口抽象化：函数签名 `reward_fn(prompt, response) → score`，默认支持规则奖励
+- 验证：toy model（OPT-125M）上跑通 GRPO，loss 下降
+
+### Step 1.3 — 测试套件
+- 新增 `tests/` 目录
+- 单元测试：advantage 计算、reward 函数
+- 集成测试：OPT-125M + mock reward，1 个 step 完整流程
+- CI 可跑
+- 验证：所有 test pass
+
+---
+
+## Phase 2: 消除冗余 forward（性能优化，不改架构）
+
+> 目标：减少每个 step 的 forward 次数
+
+### Step 2.1 — 生成时缓存 actor log prob
+- 在 `model.generate()` 过程中，记录每步的 logits 和 chosen token 的 log prob
+- 生成完后直接用缓存的 log prob，不再对 actor 重新做 teacher-forcing forward
+- 需要验证生成时 log prob 和 teacher-forcing forward 的 log prob 数值一致性
+- 验证：对比优化前后的 log prob 差异 < 1e-5，loss 曲线一致
+
+### Step 2.2 — ref log prob 复用
+- 如果上一个 step 的 actor 权重更新很小（early training / small lr），ref log prob 可以近似复用上一步的结果
+- 加一个 config 选项 `ref_logprob_recompute_freq`（默认 1 = 每步重算，可设为 N = 每 N 步重算一次）
+- 这不是零开销，但可以减少 ref forward 频率
+- 验证：设 freq=5 时训练稳定性和每步重算一致
+
+**交付：** Phase 1+2 后，每个 step 从原来的 5 次 forward（generate + actor + ref + reward + critic）降到 2 次（generate 缓存 + ref）
+
+---
+
+## Phase 3: 统一 memory layout（核心改造）
+
+> 目标：actor 和 ref 权重在同一 layout，消除搬运
+> 策略：先做 TP（简单），再做 ZeRO-3（复杂）
+
+### Phase 3a — TP 下的统一 layout（~1 周）
+
+#### Step 3a.1 — 理解 TP 的权重分片
+- 读透 Megatron-LM / DeepSpeed 的 TP 实现
+- 搞清楚权重矩阵的列/行分片方式
+- 写诊断脚本：打印每个 rank 上的 TP 权重分片
+- 验证：能清晰描述 TP 分片结构
+
+#### Step 3a.2 — ref 权重按 TP 分片存放
+- ref 权重按和 actor 完全相同的 TP 分片方式存放
+- 每个 GPU 上 actor 权重分片和 ref 权重分片并排
+- 切换 = 换指针，零数据搬运
+- 验证：OPT-7B + TP=4，ref forward 结果和独立 engine 一致
+
+#### Step 3a.3 — 统一 forward 函数（TP 版本）
+- 实现 `unified_forward(input_ids, model="actor"|"ref", mode="train"|"eval")`
+- 内部根据 model 参数切换权重指针
+- actor forward：actor 权重 + optimizer state + 梯度
+- ref forward：ref 权重，不计算梯度
+- 验证：OPT-7B + TP=4，GRPO 完整 step 正确
+
+**交付：** 中小模型（≤13B）在纯 TP 下可以零搬运推训切换
+
+### Phase 3b — ZeRO-3 下的统一 layout（~2 周）
+
+#### Step 3b.1 — 理解 ZeRO-3 的权重分片机制
+- 读透 `deepspeed/runtime/zero/partition_parameters.py`
+- 搞清楚 `ZeroParamStatus`、`all-gather`、`partition` 的时机
+- 写诊断脚本：打印 ZeRO-3 下每个 rank 持有的参数分片信息
+- 验证：能清晰描述每个 rank 上 actor 和 ref 的权重分布
+
+#### Step 3b.2 — ref 权重嵌入 ZeRO-3 分片
+- 关键洞察：ref 就是 actor 的初始快照，ref 的参数分片可以和 actor 完全一致
+- 不再单独创建 ref engine，在 actor engine 内部维护一份冻结的权重副本
+- ZeRO-3 下：ref 权重和 actor 权重在同一个 rank 上有相同的分片结构
+- 需要干预 ZeRO-3 的 gather/partition 生命周期——告诉 ZeRO "用 ref 的分片去 gather"
+- 验证：OPT-13B + ZeRO-3，ref forward 和独立 engine 一致
+
+#### Step 3b.3 — 统一 forward 函数（ZeRO-3 版本）
+- 扩展 `unified_forward` 支持 ZeRO-3 模式
+- actor forward：走正常 ZeRO-3 gather → compute → partition
+- ref forward：用 ref 权重分片做 gather，不触发 optimizer state 相关操作
+- 验证：OPT-13B + ZeRO-3，GRPO 完整 step 正确
+
+**交付：** 大模型在 ZeRO-3 + TP 下可以零搬运推训切换
+
+---
+
+## Phase 4: 推训优化（细粒度 overlap）
+
+> 目标：rollout 和其他计算并行
+
+### Step 4.1 — 算子级 overlap：generate 和 reward 计算
+- 在 TP 模式下，部分 rank 的 output 先完成后，立即开始算 reward
+- 不需要等所有 G 个 output 都生成完
+- 用 `torch.cuda.Stream` 实现 CPU 端的异步调度
+- 验证：wall time 减少，结果正确
+
+### Step 4.2 — reference 常驻 GPU
+- 如果显存允许，ref 权重常驻 GPU（Phase 3 的 layout 统一让这变得自然）
+- 利用 ZeRO offload 把 optimizer state 放 CPU，腾出 GPU 空间给 ref
+- 验证：ref forward 不触发任何 CPU↔GPU 数据搬运
+
+### Step 4.3 — ZeRO-3 generate 优化
+- 当前 ZeRO-3 的 `synced_gpus` generate 每步都做 all-gather + scatter，非常慢
+- 优化思路：generate 时暂时把 actor 权重 gathered 到 GPU（一次性 all-gather 所有参数），生成完再 partition 回去
+- 权重在 generate 期间保持 gathered 状态，不需要每步 token 都 gather/scatter
+- 验证：ZeRO-3 下 generate 速度接近 ZeRO-2
+
+**交付：** Phase 4 后，端到端每步 wall time 显著减少
+
+---
+
+## Phase 5: 生产化
+
+### Step 5.1 — 支持 LoRA
+- actor 用 LoRA 训练，ref = base model（不需要 LoRA）
+- LoRA 权重很小，ref 内存优势更大（只需要 base model 的权重）
+- 验证：LoRA GRPO 训练正确
+
+### Step 5.2 — 多数据集 + reward 函数库
+- 抽象 reward 函数接口
+- 内置：math reward（验证答案）、code reward（执行代码）、format reward
+- 支持用户自定义 reward 函数
+- 验证：不同 reward 函数可切换
+
+### Step 5.3 — 文档 + 示例
+- README 更新
+- 从零跑通 GRPO 的 end-to-end example（SFT → GRPO → inference）
+- 性能 benchmark（vs 原始 dschat PPO、vs veRL）
+- 验证：新人能照着文档复现
+
+---
+
+## 时间线建议
+
+### 无 GPU + 人工验证（opencode + GLM5.1）
+
+| Phase | 时间 | 产出 |
+|-------|------|------|
+| 1 | 2-3天 | 能跑的 GRPO trainer |
+| 2 | 1-2天 | forward 次数减半 |
+| 3a (TP) | 3-5天 | TP 下统一 layout |
+| 3b (ZeRO-3) | 2-3周 | ZeRO-3 下统一 layout |
+| 4 | 1-2周 | overlap + generate 优化 |
+| 5 | 3-5天 | 生产化 |
+| **总计** | **~5-6周** | |
+
+### 有 GPU 环境 + AI 自验证
+
+| Phase | 时间 | 产出 |
+|-------|------|------|
+| 1 | 1天 | 能跑的 GRPO trainer |
+| 2 | 0.5天 | forward 次数减半 |
+| 3a (TP) | 2-3天 | TP 下统一 layout |
+| 3b (ZeRO-3) | 1-1.5周 | ZeRO-3 下统一 layout |
+| 4 | 3-5天 | overlap + generate 优化 |
+| 5 | 2-3天 | 生产化 |
+| **总计** | **~2-3周** | |
+
