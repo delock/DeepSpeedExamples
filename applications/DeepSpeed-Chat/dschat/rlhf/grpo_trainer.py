@@ -177,9 +177,11 @@ class DeepSpeedGRPOTrainer():
         pad_token_id = self.tokenizer.pad_token_id
         attention_mask = seq.not_equal(pad_token_id).long()
 
+        logprob_start = time.time()
         with torch.no_grad():
             output = self.actor_model(seq, attention_mask=attention_mask)
             output_ref = self.ref_model(seq, attention_mask=attention_mask)
+        logprob_end = time.time()
 
         logits = output.logits
         logits_ref = output_ref.logits
@@ -197,7 +199,9 @@ class DeepSpeedGRPOTrainer():
             skip_special_tokens=True)
         responses_text = self.tokenizer.batch_decode(ans,
                                                      skip_special_tokens=True)
+        reward_start = time.time()
         reward_scores = self.reward_fn(prompts_text, responses_text)
+        reward_end = time.time()
         if not isinstance(reward_scores, torch.Tensor):
             reward_scores = torch.tensor(reward_scores,
                                          dtype=torch.float32,
@@ -210,6 +214,8 @@ class DeepSpeedGRPOTrainer():
             advantages = reward_scores
 
         self.generate_time = generate_end - generate_start
+        self.logprob_time = logprob_end - logprob_start
+        self.reward_time = reward_end - reward_start
 
         experience = {
             'prompts': gen_result['repeated_prompts'][:actual_batch],

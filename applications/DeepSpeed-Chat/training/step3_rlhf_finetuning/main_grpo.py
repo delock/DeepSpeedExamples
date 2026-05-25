@@ -538,6 +538,9 @@ def main():
                     f"Average reward score: {average_reward/inner_iter}",
                     args.global_rank)
                 print_rank_0(
+                    f"[Timing] generate={trainer.generate_time:.2f}s | logprob={getattr(trainer,'logprob_time',0):.2f}s | reward={getattr(trainer,'reward_time',0):.2f}s | train={training_time:.2f}s | e2e={e2e_time:.2f}s",
+                    args.global_rank)
+                print_rank_0(
                     "-------------------------------------------------------------------------------------",
                     args.global_rank)
 
