@@ -17,6 +17,7 @@ import sys
 import tempfile
 import os
 from typing import List, Dict, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datasets import load_dataset
 
 
@@ -143,9 +144,18 @@ class MBPPRewardFn:
         responses_text: List[str],
     ) -> List[float]:
         assert len(prompts_text) == len(responses_text)
-        scores = []
-        for prompt, response in zip(prompts_text, responses_text):
-            scores.append(self._score_one(prompt, response))
+        n = len(prompts_text)
+        scores = [0.0] * n
+        with ProcessPoolExecutor(max_workers=min(n, 16)) as executor:
+            futures = {}
+            for i, (prompt, response) in enumerate(zip(prompts_text, responses_text)):
+                futures[executor.submit(self._score_one, prompt, response)] = i
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    scores[idx] = future.result()
+                except Exception:
+                    scores[idx] = 0.0
         return scores
 
     def _score_one(self, prompt: str, response: str) -> float:
