@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import time
 import deepspeed
+from concurrent.futures import ThreadPoolExecutor
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.accelerator import get_accelerator
 
@@ -233,6 +234,110 @@ class DeepSpeedGRPOTrainer():
         self.train()
 
         return experience
+
+    def generate_experience_async(self, prompts, mask, step):
+        """
+        Like generate_experience but returns immediately with reward still
+        computing in background. Call finalize_experience() to get the
+        completed experience (blocks until reward is done).
+        """
+        self.eval()
+        generate_start = time.time()
+        gen_result = self._generate_with_repetition(prompts, mask, step)
+        generate_end = time.time()
+
+        if gen_result is None:
+            assert self.last_generated_experience is not None, \
+                f'Invalid generated experience at {step=}'
+            self.train()
+            return self.last_generated_experience, None  # already finalized
+
+        seq = gen_result['seq']
+        batch_size = gen_result['batch_size']
+        G = gen_result['num_generations']
+        prompt_length = prompts.shape[1]
+        self.prompt_length = prompt_length
+
+        pad_token_id = self.tokenizer.pad_token_id
+        attention_mask = seq.not_equal(pad_token_id).long()
+
+        logprob_start = time.time()
+        with torch.no_grad():
+            output = self.actor_model(seq, attention_mask=attention_mask)
+            output_ref = self.ref_model(seq, attention_mask=attention_mask)
+        logprob_end = time.time()
+
+        logits = output.logits
+        logits_ref = output_ref.logits
+        if self.compute_fp32_loss:
+            logits = logits.to(torch.float)
+            logits_ref = logits_ref.to(torch.float)
+
+        log_probs = gather_log_probs(logits[:, :-1, :], seq[:, 1:])
+        ref_log_probs = gather_log_probs(logits_ref[:, :-1, :], seq[:, 1:])
+
+        ans = seq[:, prompt_length:]
+        actual_batch = seq.shape[0]
+        prompts_text = self.tokenizer.batch_decode(
+            gen_result['repeated_prompts'][:actual_batch],
+            skip_special_tokens=True)
+        responses_text = self.tokenizer.batch_decode(ans,
+                                                     skip_special_tokens=True)
+
+        # Submit reward to background thread (reward itself uses ProcessPool)
+        reward_start = time.time()
+        if not hasattr(self, '_reward_executor'):
+            self._reward_executor = ThreadPoolExecutor(max_workers=1)
+        reward_future = self._reward_executor.submit(
+            self.reward_fn, prompts_text, responses_text)
+
+        self.generate_time = generate_end - generate_start
+        self.logprob_time = logprob_end - logprob_start
+        self._reward_start = reward_start
+
+        pending_experience = {
+            'prompts': gen_result['repeated_prompts'][:actual_batch],
+            'logprobs': log_probs,
+            'ref_logprobs': ref_log_probs,
+            'input_ids': seq,
+            'attention_mask': attention_mask,
+            'prompt_length': prompt_length,
+            'batch_size': batch_size,
+            'num_generations': G,
+            '_reward_future': reward_future,
+        }
+        self.train()
+        return pending_experience, reward_future
+
+    def finalize_experience(self, pending_experience):
+        """
+        Block until reward is computed, then fill in advantages/reward_scores.
+        """
+        reward_future = pending_experience.pop('_reward_future')
+        reward_scores = reward_future.result()
+        reward_end = time.time()
+        self.reward_time = reward_end - self._reward_start
+
+        seq = pending_experience['input_ids']
+        batch_size = pending_experience['batch_size']
+        G = pending_experience['num_generations']
+
+        if not isinstance(reward_scores, torch.Tensor):
+            reward_scores = torch.tensor(reward_scores,
+                                         dtype=torch.float32,
+                                         device=seq.device)
+
+        actual_batch = seq.shape[0]
+        if actual_batch == batch_size * G:
+            advantages = self.compute_group_advantages(
+                reward_scores, batch_size, G)
+        else:
+            advantages = reward_scores
+
+        pending_experience['advantages'] = advantages
+        pending_experience['reward_scores'] = reward_scores
+        self.last_generated_experience = pending_experience
+        return pending_experience
 
     def train_grpo(self, inputs):
         log_probs = inputs['logprobs']

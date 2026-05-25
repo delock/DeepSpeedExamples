@@ -326,6 +326,13 @@ def parse_args():
         default=5.0,
         help="Per-sample subprocess timeout (seconds) for humaneval reward.",
     )
+    parser.add_argument(
+        "--async_reward",
+        action="store_true",
+        default=False,
+        help="Overlap reward computation (CPU) with next step's generation (GPU). "
+             "Introduces one-step policy staleness on rollouts.",
+    )
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -389,6 +396,76 @@ def create_datasets(args, tokenizer, train_phase=3):
     num_total_iters = int(args.num_train_epochs * num_update_steps_per_epoch)
 
     return prompt_train_dataloader, unsupervised_train_dataloader, num_total_iters
+
+
+def _do_training(out, batch_unsupervised, args, trainer, rlhf_engine,
+                 exp_mini_dataset, unsup_mini_dataset,
+                 unsupervised_training_enabled, epoch, step, device, writer):
+    """Run the training inner loop on a finalized experience."""
+    if batch_unsupervised is not None:
+        batch_unsupervised = to_device(batch_unsupervised, device)
+        unsup_mini_dataset.add(batch_unsupervised)
+    else:
+        unsup_mini_dataset.add(
+            [[None] * args.per_device_generation_batch_size])
+
+    exp_dataset = exp_mini_dataset.add(out)
+    if exp_dataset is None:
+        return
+
+    if args.actor_gradient_checkpointing:
+        rlhf_engine.actor.gradient_checkpointing_enable()
+
+    inner_iter = 0
+    actor_loss_sum, unsup_loss_sum = 0, 0
+    average_reward = 0
+
+    unsup_dataset = [None] * len(exp_dataset)
+    for i, exp_data in enumerate(exp_dataset):
+        actor_loss = trainer.train_grpo(exp_data)
+        actor_loss_sum += actor_loss.item()
+        average_reward += exp_data["reward_scores"].mean()
+
+        if unsupervised_training_enabled and unsup_dataset[i] is not None:
+            unsup_loss = trainer.train_unsupervised(unsup_dataset[i], args.unsup_coef)
+            unsup_loss_sum += unsup_loss.item()
+
+        inner_iter += 1
+
+    average_reward = get_all_reduce_mean(average_reward).item()
+    # Store for _print_step_info
+    trainer._last_inner_iter = inner_iter
+    trainer._last_actor_loss_sum = actor_loss_sum
+    trainer._last_unsup_loss_sum = unsup_loss_sum
+    trainer._last_average_reward = average_reward
+
+    if writer is not None and torch.distributed.get_rank() == 0:
+        writer.add_scalar('reward', average_reward / inner_iter, global_step=step)
+        writer.add_scalar('actor_loss', actor_loss.item(), global_step=step)
+        writer.flush()
+
+
+def _print_step_info(trainer, args, epoch, step, training_time):
+    """Print per-step metrics and timing."""
+    inner_iter = getattr(trainer, '_last_inner_iter', 1)
+    actor_loss_sum = getattr(trainer, '_last_actor_loss_sum', 0)
+    unsup_loss_sum = getattr(trainer, '_last_unsup_loss_sum', 0)
+    average_reward = getattr(trainer, '_last_average_reward', 0)
+
+    e2e_time = training_time + trainer.generate_time * args.generation_batches
+
+    print_rank_0(
+        f'Epoch: {epoch} | Step: {step} | Actor Loss: {actor_loss_sum/inner_iter} | Unsupervised Loss: {unsup_loss_sum/inner_iter}',
+        args.global_rank)
+    print_rank_0(
+        f"Average reward score: {average_reward/inner_iter}",
+        args.global_rank)
+    print_rank_0(
+        f"[Timing] generate={trainer.generate_time:.2f}s | logprob={getattr(trainer,'logprob_time',0):.2f}s | reward={getattr(trainer,'reward_time',0):.2f}s | train={training_time:.2f}s | e2e={e2e_time:.2f}s",
+        args.global_rank)
+    print_rank_0(
+        "-------------------------------------------------------------------------------------",
+        args.global_rank)
 
 
 def main():
@@ -485,74 +562,61 @@ def main():
         print_rank_0(
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Generation Batches {min(len(prompt_train_dataloader), len(unsupervised_train_dataloader))}",
             args.global_rank)
+
+        pending_exp = None  # For async mode: experience awaiting reward
+
         for step, (batch_prompt, batch_unsupervised) in enumerate(
                 zip(prompt_train_dataloader, unsupervised_train_dataloader)):
 
             batch_prompt = to_device(batch_prompt, device)
 
-            out = trainer.generate_experience(batch_prompt['prompt'],
-                                              batch_prompt['prompt_att_mask'],
-                                              step)
+            if args.async_reward:
+                # --- Async pipeline: overlap reward with next generate ---
+                # 1. Start generate + logprob, submit reward async
+                exp_pending, reward_future = trainer.generate_experience_async(
+                    batch_prompt['prompt'], batch_prompt['prompt_att_mask'], step)
 
-            training_start = time.time()
-            if batch_unsupervised is not None:
-                batch_unsupervised = to_device(batch_unsupervised, device)
-                unsup_dataset = unsup_mini_dataset.add(batch_unsupervised)
+                # 2. If we have a pending experience from previous step, train it now
+                if pending_exp is not None:
+                    out = trainer.finalize_experience(pending_exp)
+                    training_start = time.time()
+                    _do_training(out, batch_unsupervised, args, trainer,
+                                 rlhf_engine, exp_mini_dataset,
+                                 unsup_mini_dataset, unsupervised_training_enabled,
+                                 epoch, step - 1, device, writer if args.enable_tensorboard else None)
+                    training_end = time.time()
+                    _print_step_info(trainer, args, epoch, step - 1,
+                                     training_end - training_start)
+
+                # 3. Queue current experience for next iteration
+                if reward_future is not None:
+                    pending_exp = exp_pending
+                else:
+                    # gen_result was None, reused last experience
+                    pending_exp = None
+                    out = exp_pending
+                    training_start = time.time()
+                    _do_training(out, batch_unsupervised, args, trainer,
+                                 rlhf_engine, exp_mini_dataset,
+                                 unsup_mini_dataset, unsupervised_training_enabled,
+                                 epoch, step, device, writer if args.enable_tensorboard else None)
+                    training_end = time.time()
+                    _print_step_info(trainer, args, epoch, step,
+                                     training_end - training_start)
             else:
-                unsup_dataset = unsup_mini_dataset.add(
-                    [[None] * args.per_device_generation_batch_size])
+                # --- Synchronous mode (original) ---
+                out = trainer.generate_experience(batch_prompt['prompt'],
+                                                  batch_prompt['prompt_att_mask'],
+                                                  step)
 
-            exp_dataset = exp_mini_dataset.add(out)
-
-            if exp_dataset is not None:
-                inner_iter = 0
-                actor_loss_sum, unsup_loss_sum = 0, 0
-                average_reward = 0
-
-                if args.actor_gradient_checkpointing:
-                    rlhf_engine.actor.gradient_checkpointing_enable()
-
-                for i, (exp_data, unsup_data) in enumerate(
-                        zip(exp_dataset, unsup_dataset)):
-                    actor_loss = trainer.train_grpo(exp_data)
-                    actor_loss_sum += actor_loss.item()
-                    average_reward += exp_data["reward_scores"].mean()
-
-                    if unsupervised_training_enabled:
-                        unsup_loss = trainer.train_unsupervised(
-                            unsup_data, args.unsup_coef)
-                        unsup_loss_sum += unsup_loss.item()
-
-                    inner_iter += 1
-
-                end = time.time()
-                training_time = end - training_start
-                e2e_time = training_time + trainer.generate_time * args.generation_batches
-
-                average_reward = get_all_reduce_mean(average_reward).item()
-
-                print_rank_0(
-                    f'Epoch: {epoch} | Step: {step} | Actor Loss: {actor_loss_sum/inner_iter} | Unsupervised Loss: {unsup_loss_sum/inner_iter}',
-                    args.global_rank)
-                print_rank_0(
-                    f"Average reward score: {average_reward/inner_iter}",
-                    args.global_rank)
-                print_rank_0(
-                    f"[Timing] generate={trainer.generate_time:.2f}s | logprob={getattr(trainer,'logprob_time',0):.2f}s | reward={getattr(trainer,'reward_time',0):.2f}s | train={training_time:.2f}s | e2e={e2e_time:.2f}s",
-                    args.global_rank)
-                print_rank_0(
-                    "-------------------------------------------------------------------------------------",
-                    args.global_rank)
-
-                if args.enable_tensorboard and torch.distributed.get_rank(
-                ) == 0:
-                    writer.add_scalar('reward',
-                                      average_reward / inner_iter,
-                                      global_step=step)
-                    writer.add_scalar('actor_loss',
-                                      actor_loss.item(),
-                                      global_step=step)
-                    writer.flush()
+                training_start = time.time()
+                _do_training(out, batch_unsupervised, args, trainer,
+                             rlhf_engine, exp_mini_dataset,
+                             unsup_mini_dataset, unsupervised_training_enabled,
+                             epoch, step, device, writer if args.enable_tensorboard else None)
+                training_end = time.time()
+                _print_step_info(trainer, args, epoch, step,
+                                 training_end - training_start)
 
             if args.actor_gradient_checkpointing:
                 rlhf_engine.actor.gradient_checkpointing_disable()
@@ -567,6 +631,19 @@ def main():
 
             if args.enable_test_mode and non_overflow_step_count == args.test_stop_step:
                 break
+
+        # Flush last pending experience in async mode
+        if args.async_reward and pending_exp is not None:
+            out = trainer.finalize_experience(pending_exp)
+            training_start = time.time()
+            _do_training(out, None, args, trainer,
+                         rlhf_engine, exp_mini_dataset,
+                         unsup_mini_dataset, unsupervised_training_enabled,
+                         epoch, step, device, writer if args.enable_tensorboard else None)
+            training_end = time.time()
+            _print_step_info(trainer, args, epoch, step,
+                             training_end - training_start)
+            pending_exp = None
 
         if args.enable_test_mode:
             break
