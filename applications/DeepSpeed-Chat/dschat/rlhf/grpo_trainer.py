@@ -51,8 +51,12 @@ class DeepSpeedGRPOTrainer():
         self.tokenizer = self.rlhf_engine.tokenizer
         self.args = args
         self.max_answer_seq_len = args.max_answer_seq_len
-        self.end_of_conversation_token_id = self.tokenizer(
-            args.end_of_conversation_token)['input_ids'][-1]
+        eot_token = args.end_of_conversation_token
+        if eot_token:
+            token_ids = self.tokenizer(eot_token)['input_ids']
+            self.end_of_conversation_token_id = token_ids[-1] if token_ids else self.tokenizer.eos_token_id
+        else:
+            self.end_of_conversation_token_id = self.tokenizer.eos_token_id
         self.z3_enabled = args.actor_zero_stage == 3
         self.compute_fp32_loss = self.args.compute_fp32_loss
 
@@ -75,16 +79,16 @@ class DeepSpeedGRPOTrainer():
     def _generate_sequence(self, prompts, mask, step):
         max_min_length = self.max_answer_seq_len + prompts.shape[1]
 
-        if self.actor_model.module.config.model_type == "llama":
-            kwargs = dict(do_sample=False)
-        else:
-            kwargs = dict()
+        # Always sample with temperature > 0 so that G generations per prompt
+        # are diverse; greedy decoding (do_sample=False) makes all G outputs
+        # identical and collapses the group advantage to 0.
+        kwargs = dict(do_sample=True, temperature=0.9, top_p=0.95)
 
         with torch.no_grad():
             seq = self.actor_model.module.generate(
                 prompts,
                 attention_mask=mask,
-                max_length=max_min_length,
+                max_new_tokens=self.max_answer_seq_len,
                 pad_token_id=self.tokenizer.pad_token_id,
                 synced_gpus=self.z3_enabled,
                 **kwargs)

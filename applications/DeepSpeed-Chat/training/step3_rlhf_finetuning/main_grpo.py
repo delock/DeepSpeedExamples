@@ -308,6 +308,24 @@ def parse_args():
                         type=float,
                         default=0.2,
                         help="PPO clip range for GRPO actor loss.")
+    parser.add_argument(
+        "--reward_type",
+        type=str,
+        default="mock",
+        choices=["mock", "humaneval", "mbpp", "mixed"],
+        help=(
+            "Reward function to use.  "
+            "'mock' returns 1.0 for every response (for debugging). "
+            "'humaneval' executes generated code against HumanEval unit tests. "
+            "'mbpp' executes generated code against MBPP unit tests."
+        ),
+    )
+    parser.add_argument(
+        "--humaneval_timeout",
+        type=float,
+        default=5.0,
+        help="Per-sample subprocess timeout (seconds) for humaneval reward.",
+    )
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -416,7 +434,38 @@ def main():
         print_rank_0("Mixed Precision ZeRO++ enabled")
 
     grpo_trainer_cls = DeepSpeedGRPOTrainerUnsupervised if unsupervised_training_enabled else DeepSpeedGRPOTrainer
-    trainer = grpo_trainer_cls(rlhf_engine, args)
+
+    # ------------------------------------------------------------------ #
+    # Reward function selection                                            #
+    # ------------------------------------------------------------------ #
+    if args.reward_type == "humaneval":
+        from dschat.utils.reward.humaneval_reward import HumanEvalRewardFn
+        reward_fn = HumanEvalRewardFn(timeout=args.humaneval_timeout)
+        print_rank_0(
+            f"Using HumanEval reward (timeout={args.humaneval_timeout}s, "
+            f"{reward_fn.task_count} tasks loaded)",
+            args.global_rank,
+        )
+    elif args.reward_type == "mbpp":
+        from dschat.utils.reward.mbpp_reward import MBPPRewardFn
+        reward_fn = MBPPRewardFn(timeout=args.humaneval_timeout, split="train")
+        print_rank_0(
+            f"Using MBPP reward (timeout={args.humaneval_timeout}s, "
+            f"{reward_fn.task_count} tasks loaded)",
+            args.global_rank,
+        )
+    elif args.reward_type == "mixed":
+        from dschat.utils.reward.mixed_reward import MixedRewardFn
+        reward_fn = MixedRewardFn(timeout=args.humaneval_timeout)
+        print_rank_0(
+            f"Using Mixed reward (HumanEval + MBPP, timeout={args.humaneval_timeout}s)",
+            args.global_rank,
+        )
+    else:
+        reward_fn = None   # trainer uses default mock (always 1.0)
+        print_rank_0("Using mock reward (all 1.0)", args.global_rank)
+
+    trainer = grpo_trainer_cls(rlhf_engine, args, reward_fn=reward_fn)
 
     exp_mini_dataset = MiniDataset(args.generation_batches,
                                    args.per_device_training_batch_size)

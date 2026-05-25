@@ -15,6 +15,9 @@ import os
 import hashlib
 from itertools import chain
 from dschat.utils.data import raw_datasets
+from dschat.utils.data.humaneval_dataset import HumanEvalRawDataset
+from dschat.utils.data.mbpp_dataset import MBPPRawDataset
+from dschat.utils.data.codealpaca_dataset import CodeAlpacaDataset
 from deepspeed.accelerator import get_accelerator
 
 
@@ -76,6 +79,12 @@ def get_raw_dataset(dataset_name, output_path, seed, local_rank):
             )
         return raw_datasets.LocalJsonFileDataset(output_path, seed, local_rank,
                                                  dataset_name, chat_path)
+    elif "openai/openai_humaneval" in dataset_name:
+        return HumanEvalRawDataset(output_path, seed, local_rank, dataset_name)
+    elif "mbpp" in dataset_name:
+        return MBPPRawDataset(output_path, seed, local_rank, dataset_name)
+    elif "CodeAlpaca" in dataset_name or "codealpaca" in dataset_name.lower():
+        return CodeAlpacaDataset(output_path, seed, local_rank, dataset_name)
     else:
         raise RuntimeError(
             f"We do not have configs for dataset {dataset_name}, but you can add it by yourself in raw_datasets.py."
@@ -496,7 +505,14 @@ class MiniDataset:
             if type(large_batch) == list or type(large_batch) == tuple:
                 large_size = len(large_batch[0])
             elif type(large_batch) == dict:
-                large_size = len(large_batch[list(large_batch.keys())[0]])
+                # Find first non-scalar value to get batch size
+                large_size = None
+                for v in large_batch.values():
+                    if hasattr(v, '__len__') and not isinstance(v, (int, float)):
+                        large_size = len(v)
+                        break
+                if large_size is None:
+                    large_size = 1
             else:
                 large_size = len(large_batch)
             for i in range(0, large_size, self.small_batch_size):
@@ -506,6 +522,8 @@ class MiniDataset:
                 elif type(large_batch) == dict:
                     small_dataset.append({
                         k: v[i:i + self.small_batch_size]
+                        if hasattr(v, '__getitem__') and not isinstance(v, (int, float))
+                        else v
                         for k, v in large_batch.items()
                     })
                 else:
