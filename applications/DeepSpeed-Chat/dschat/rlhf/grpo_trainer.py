@@ -139,20 +139,98 @@ class DeepSpeedGRPOTrainer():
 
     def _generate_with_repetition(self, prompts, mask, step):
         G = self.num_generations
-        repeated_prompts = prompts.repeat_interleave(G, dim=0)
-        repeated_mask = mask.repeat_interleave(G, dim=0)
 
-        seq = self._generate_sequence(repeated_prompts, repeated_mask, step)
+        if getattr(self.args, 'shared_prefix_generate', False):
+            seq = self._generate_shared_prefix(prompts, mask, G, step)
+        else:
+            repeated_prompts = prompts.repeat_interleave(G, dim=0)
+            repeated_mask = mask.repeat_interleave(G, dim=0)
+            seq = self._generate_sequence(repeated_prompts, repeated_mask, step)
+
         if seq is None:
             return None
 
+        repeated_prompts_out = prompts.repeat_interleave(G, dim=0)
         return {
             'prompts': prompts,
-            'repeated_prompts': repeated_prompts,
+            'repeated_prompts': repeated_prompts_out,
             'seq': seq,
             'batch_size': prompts.shape[0],
             'num_generations': G,
         }
+
+    def _generate_shared_prefix(self, prompts, mask, G, step):
+        """
+        Prefill each unique prompt once, copy KV cache G times,
+        then decode G responses sharing the same prefix cache.
+        Saves (G-1)/G of prefill compute.
+        """
+        kwargs = dict(do_sample=True, temperature=0.9, top_p=0.95)
+
+        with torch.no_grad():
+            # Step 1: Prefill unique prompts (batch_size forward passes worth)
+            prefill_out = self.actor_model.module(
+                prompts, attention_mask=mask, use_cache=True)
+            past = prefill_out.past_key_values
+
+            # Step 2: Expand KV cache G times per prompt
+            expanded_past = past.batch_repeat_interleave(G)
+
+            # Step 3: Expand input_ids and attention_mask
+            expanded_ids = prompts.repeat_interleave(G, dim=0)
+            expanded_mask = mask.repeat_interleave(G, dim=0)
+
+            # Step 4: Generate with pre-computed cache
+            seq = self.actor_model.module.generate(
+                expanded_ids,
+                attention_mask=expanded_mask,
+                max_new_tokens=self.max_answer_seq_len,
+                pad_token_id=self.tokenizer.pad_token_id,
+                synced_gpus=self.z3_enabled,
+                past_key_values=expanded_past,
+                **kwargs)
+
+        batch_size = seq.shape[0]
+        prompt_length = prompts.shape[1]
+        self.prompt_length = prompt_length
+        ans = seq[:, prompt_length:]
+        valid_ans_len = (ans != self.tokenizer.pad_token_id).sum(dim=-1)
+
+        # Track sequence length stats for profiling
+        self._last_seq_lengths = valid_ans_len.cpu().tolist()
+        self._last_prompt_length = prompt_length
+        self._last_total_seq_length = seq.shape[1]
+
+        if self.args.print_answers and (step % self.args.print_answers_interval == 0):
+            print(
+                f"--- prompt --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(prompts, skip_special_tokens=True)}"
+            )
+            print(
+                f"--- ans    --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(ans, skip_special_tokens=True)}"
+            )
+
+        out_seq = []
+        for i in range(batch_size):
+            if valid_ans_len[i] <= 1:
+                print(
+                    f'Dropping too short generated answer: {step=}: \n'
+                    f'prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                    f'answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+                )
+                continue
+            else:
+                out_seq.append(seq[i:i + 1])
+
+        if not out_seq:
+            print(
+                f'All generated results are too short for rank={self.args.local_rank} step={step}\n'
+                f'-> prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                f'-> answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+            )
+            return None
+
+        out_seq = torch.cat(out_seq, dim=0)
+        return out_seq
 
     def compute_group_advantages(self, reward_scores, batch_size, G):
         rewards_grouped = reward_scores.view(batch_size, G)

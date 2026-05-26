@@ -333,6 +333,13 @@ def parse_args():
         help="Overlap reward computation (CPU) with next step's generation (GPU). "
              "Introduces one-step policy staleness on rollouts.",
     )
+    parser.add_argument(
+        "--shared_prefix_generate",
+        action="store_true",
+        default=False,
+        help="Prefill each prompt once then copy KV cache G times for decoding. "
+             "Saves (G-1)/G of prefill compute.",
+    )
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
