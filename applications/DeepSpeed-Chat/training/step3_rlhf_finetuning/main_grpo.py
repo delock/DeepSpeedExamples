@@ -463,6 +463,19 @@ def _print_step_info(trainer, args, epoch, step, training_time):
     print_rank_0(
         f"[Timing] generate={trainer.generate_time:.2f}s | logprob={getattr(trainer,'logprob_time',0):.2f}s | reward={getattr(trainer,'reward_time',0):.2f}s | train={training_time:.2f}s | e2e={e2e_time:.2f}s",
         args.global_rank)
+
+    # Sequence length stats
+    seq_lens = getattr(trainer, '_last_seq_lengths', [])
+    if seq_lens:
+        import numpy as np
+        arr = np.array(seq_lens)
+        print_rank_0(
+            f"[SeqLen] prompt={getattr(trainer,'_last_prompt_length',0)} | "
+            f"ans: min={arr.min()}, max={arr.max()}, mean={arr.mean():.1f}, std={arr.std():.1f} | "
+            f"total_padded={getattr(trainer,'_last_total_seq_length',0)} | "
+            f"util={arr.mean()/(getattr(trainer,'_last_total_seq_length',1)-getattr(trainer,'_last_prompt_length',0))*100:.1f}%",
+            args.global_rank)
+
     print_rank_0(
         "-------------------------------------------------------------------------------------",
         args.global_rank)

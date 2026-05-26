@@ -100,6 +100,11 @@ class DeepSpeedGRPOTrainer():
         ans = seq[:, prompt_length:]
         valid_ans_len = (ans != self.tokenizer.pad_token_id).sum(dim=-1)
 
+        # Track sequence length stats for profiling
+        self._last_seq_lengths = valid_ans_len.cpu().tolist()
+        self._last_prompt_length = prompt_length
+        self._last_total_seq_length = seq.shape[1]
+
         if self.args.print_answers and (step % self.args.print_answers_interval
                                         == 0):
             print(
