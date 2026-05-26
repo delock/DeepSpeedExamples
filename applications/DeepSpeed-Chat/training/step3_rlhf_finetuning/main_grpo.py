@@ -340,6 +340,13 @@ def parse_args():
         help="Prefill each prompt once then copy KV cache G times for decoding. "
              "Saves (G-1)/G of prefill compute.",
     )
+    parser.add_argument(
+        "--early_exit_generate",
+        action="store_true",
+        default=False,
+        help="Custom decode loop with batch compaction: removes finished sequences "
+             "from the batch on EOS. Includes shared prefix. Saves both prefill and decode padding.",
+    )
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()

@@ -140,7 +140,9 @@ class DeepSpeedGRPOTrainer():
     def _generate_with_repetition(self, prompts, mask, step):
         G = self.num_generations
 
-        if getattr(self.args, 'shared_prefix_generate', False):
+        if getattr(self.args, 'early_exit_generate', False):
+            seq = self._generate_early_exit(prompts, mask, G, step)
+        elif getattr(self.args, 'shared_prefix_generate', False):
             seq = self._generate_shared_prefix(prompts, mask, G, step)
         else:
             repeated_prompts = prompts.repeat_interleave(G, dim=0)
@@ -199,6 +201,145 @@ class DeepSpeedGRPOTrainer():
         # Track sequence length stats for profiling
         self._last_seq_lengths = valid_ans_len.cpu().tolist()
         self._last_prompt_length = prompt_length
+        self._last_total_seq_length = seq.shape[1]
+
+        if self.args.print_answers and (step % self.args.print_answers_interval == 0):
+            print(
+                f"--- prompt --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(prompts, skip_special_tokens=True)}"
+            )
+            print(
+                f"--- ans    --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(ans, skip_special_tokens=True)}"
+            )
+
+        out_seq = []
+        for i in range(batch_size):
+            if valid_ans_len[i] <= 1:
+                print(
+                    f'Dropping too short generated answer: {step=}: \n'
+                    f'prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                    f'answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+                )
+                continue
+            else:
+                out_seq.append(seq[i:i + 1])
+
+        if not out_seq:
+            print(
+                f'All generated results are too short for rank={self.args.local_rank} step={step}\n'
+                f'-> prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                f'-> answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+            )
+            return None
+
+        out_seq = torch.cat(out_seq, dim=0)
+        return out_seq
+
+    def _sample_top_p(self, logits, temperature=0.9, top_p=0.95):
+        """Sample from logits with temperature and nucleus (top-p) filtering."""
+        logits = logits / temperature
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(
+            torch.softmax(sorted_logits, dim=-1), dim=-1)
+        mask = (cumulative_probs - torch.softmax(sorted_logits, dim=-1)) >= top_p
+        sorted_logits[mask] = -float('inf')
+        probs = torch.softmax(sorted_logits, dim=-1)
+        sampled = torch.multinomial(probs, 1)
+        tokens = sorted_indices.gather(1, sampled)
+        return tokens
+
+    def _generate_early_exit(self, prompts, mask, G, step):
+        """
+        Custom decode loop with batch compaction: prefill once, expand KV cache,
+        then decode token-by-token removing finished sequences from the batch.
+        Combines shared-prefix (saves prefill) + early-exit (saves decode padding).
+        """
+        device = prompts.device
+        B = prompts.shape[0]
+        total = B * G
+        prompt_len = prompts.shape[1]
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+
+        with torch.no_grad():
+            # Prefill unique prompts once
+            out = self.actor_model.module(
+                prompts, attention_mask=mask, use_cache=True)
+            past = out.past_key_values
+
+            # Expand KV cache G times
+            past.batch_repeat_interleave(G)
+
+            # Expand attention mask for decode (will grow each step)
+            # Shape: [total, prompt_len] -> extended each decode step
+            attn_mask = mask.repeat_interleave(G, dim=0)  # [total, prompt_len]
+
+            # Sample first token from prefill logits
+            first_logits = out.logits[:, -1, :].repeat_interleave(G, dim=0)
+            next_tokens = self._sample_top_p(first_logits)  # [total, 1]
+
+            # Storage for all generated tokens
+            all_tokens = torch.full(
+                (total, self.max_answer_seq_len), pad_token_id,
+                dtype=torch.long, device=device)
+            all_tokens[:, 0] = next_tokens.squeeze(1)
+            gen_lens = torch.ones(total, dtype=torch.long, device=device)
+
+            # Extend attention mask for the first generated token
+            attn_mask = torch.cat([attn_mask, torch.ones(total, 1, dtype=attn_mask.dtype, device=device)], dim=1)
+
+            # Track active sequences
+            active_idx = torch.arange(total, device=device)
+            finished = (next_tokens.squeeze(1) == eos_token_id)
+            if finished.any():
+                keep = ~finished
+                active_idx = active_idx[keep]
+                next_tokens = next_tokens[keep]
+                past.reorder_cache(torch.where(keep)[0])
+                attn_mask = attn_mask[keep]
+
+            # Decode loop with compaction
+            for decode_step in range(1, self.max_answer_seq_len):
+                if active_idx.shape[0] == 0:
+                    break
+
+                out = self.actor_model.module(
+                    next_tokens, attention_mask=attn_mask,
+                    past_key_values=past, use_cache=True)
+                past = out.past_key_values
+                next_tokens = self._sample_top_p(out.logits[:, -1, :])
+
+                # Store tokens back to original positions
+                all_tokens[active_idx, decode_step] = next_tokens.squeeze(1)
+                gen_lens[active_idx] = decode_step + 1
+
+                # Extend attention mask
+                attn_mask = torch.cat([attn_mask, torch.ones(attn_mask.shape[0], 1, dtype=attn_mask.dtype, device=device)], dim=1)
+
+                # Remove finished sequences
+                finished = (next_tokens.squeeze(1) == eos_token_id)
+                if finished.any():
+                    keep = ~finished
+                    if not keep.any():
+                        break
+                    active_idx = active_idx[keep]
+                    next_tokens = next_tokens[keep]
+                    past.reorder_cache(torch.where(keep)[0])
+                    attn_mask = attn_mask[keep]
+
+        # Build output: [prompt | generated]
+        max_gen = gen_lens.max().item()
+        all_tokens = all_tokens[:, :max_gen]
+        expanded_prompts = prompts.repeat_interleave(G, dim=0)
+        seq = torch.cat([expanded_prompts, all_tokens], dim=1)
+
+        # Post-processing (same as _generate_shared_prefix)
+        batch_size = seq.shape[0]
+        self.prompt_length = prompt_len
+        ans = seq[:, prompt_len:]
+        valid_ans_len = (ans != pad_token_id).sum(dim=-1)
+
+        self._last_seq_lengths = valid_ans_len.cpu().tolist()
+        self._last_prompt_length = prompt_len
         self._last_total_seq_length = seq.shape[1]
 
         if self.args.print_answers and (step % self.args.print_answers_interval == 0):
