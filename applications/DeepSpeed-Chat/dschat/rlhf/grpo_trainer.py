@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import copy
 import torch
 import torch.nn.functional as F
 import time
@@ -41,6 +42,20 @@ def gather_log_probs(logits, labels):
     log_probs = F.log_softmax(logits, dim=-1)
     log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(-1))
     return log_probs_labels.squeeze(-1)
+
+
+def compute_log_probs_microbatch(model, seq, attention_mask, compute_fp32_loss=False, micro_batch_size=8):
+    """Compute log probs with micro-batching to avoid OOM."""
+    all_log_probs = []
+    for i in range(0, seq.shape[0], micro_batch_size):
+        mb_seq = seq[i:i+micro_batch_size]
+        mb_mask = attention_mask[i:i+micro_batch_size]
+        mb_logits = model(mb_seq, attention_mask=mb_mask).logits
+        if compute_fp32_loss:
+            mb_logits = mb_logits.to(torch.float)
+        all_log_probs.append(gather_log_probs(mb_logits[:, :-1, :], mb_seq[:, 1:]))
+        del mb_logits
+    return torch.cat(all_log_probs, dim=0)
 
 
 class DeepSpeedGRPOTrainer():
@@ -140,14 +155,53 @@ class DeepSpeedGRPOTrainer():
     def _generate_with_repetition(self, prompts, mask, step):
         G = self.num_generations
 
-        if getattr(self.args, 'early_exit_generate', False):
-            seq = self._generate_early_exit(prompts, mask, G, step)
+        if getattr(self.args, 'continuous_batching_generate', False):
+            seq = self._generate_continuous_batching(prompts, mask, G, step)
+        elif getattr(self.args, 'early_exit_generate', False):
+            cb_size = getattr(self.args, 'continuous_batching_size', 0)
+            if cb_size and cb_size < G:
+                # Split G into micro-batches of cb_size for early_exit
+                seq_parts = []
+                for g_start in range(0, G, cb_size):
+                    g_end = min(g_start + cb_size, G)
+                    sub_G = g_end - g_start
+                    part = self._generate_early_exit(prompts, mask, sub_G, step)
+                    if part is not None:
+                        seq_parts.append(part)
+                if not seq_parts:
+                    seq = None
+                else:
+                    seq = self._pad_and_cat(seq_parts)
+            else:
+                seq = self._generate_early_exit(prompts, mask, G, step)
         elif getattr(self.args, 'shared_prefix_generate', False):
-            seq = self._generate_shared_prefix(prompts, mask, G, step)
+            cb_size = getattr(self.args, 'continuous_batching_size', 0)
+            if cb_size and cb_size < G:
+                seq_parts = []
+                for g_start in range(0, G, cb_size):
+                    sub_G = min(cb_size, G - g_start)
+                    part = self._generate_shared_prefix(prompts, mask, sub_G, step)
+                    if part is not None:
+                        seq_parts.append(part)
+                seq = self._pad_and_cat(seq_parts) if seq_parts else None
+            else:
+                seq = self._generate_shared_prefix(prompts, mask, G, step)
         else:
-            repeated_prompts = prompts.repeat_interleave(G, dim=0)
-            repeated_mask = mask.repeat_interleave(G, dim=0)
-            seq = self._generate_sequence(repeated_prompts, repeated_mask, step)
+            cb_size = getattr(self.args, 'continuous_batching_size', 0)
+            if cb_size and cb_size < G:
+                seq_parts = []
+                for g_start in range(0, G, cb_size):
+                    sub_G = min(cb_size, G - g_start)
+                    repeated_prompts = prompts.repeat_interleave(sub_G, dim=0)
+                    repeated_mask = mask.repeat_interleave(sub_G, dim=0)
+                    part = self._generate_sequence(repeated_prompts, repeated_mask, step)
+                    if part is not None:
+                        seq_parts.append(part)
+                seq = self._pad_and_cat(seq_parts) if seq_parts else None
+            else:
+                repeated_prompts = prompts.repeat_interleave(G, dim=0)
+                repeated_mask = mask.repeat_interleave(G, dim=0)
+                seq = self._generate_sequence(repeated_prompts, repeated_mask, step)
 
         if seq is None:
             return None
@@ -246,6 +300,268 @@ class DeepSpeedGRPOTrainer():
         sampled = torch.multinomial(probs, 1)
         tokens = sorted_indices.gather(1, sampled)
         return tokens
+
+    def _cb_replace_slot_inplace(self, slot_idx, past, prompt_past, attn_mask,
+                                  first_logits, next_tokens, all_tokens, gen_lens,
+                                  slot_rollout, slot_decode_step, slot_position,
+                                  new_rollout_idx, prompt_len, B, device):
+        """Replace a finished slot with a new rollout by left-padding prompt KV."""
+        current_kv_len = past.layers[0].keys.shape[2]
+        pad_len = current_kv_len - prompt_len
+
+        src_prompt_idx = 0 if B == 1 else new_rollout_idx // (len(all_tokens) // B)
+
+        # Replace KV cache for this slot: [zeros | prompt_kv]
+        for layer_idx in range(len(past)):
+            key, value = past[layer_idx]
+            src_key, src_value = prompt_past[layer_idx]
+            heads = key.shape[1]
+            head_dim = key.shape[3]
+
+            pad_kv = torch.zeros(1, heads, pad_len, head_dim,
+                                 dtype=key.dtype, device=device)
+            new_key = torch.cat([pad_kv, src_key[src_prompt_idx:src_prompt_idx+1]], dim=2)
+            new_value = torch.cat([pad_kv, src_value[src_prompt_idx:src_prompt_idx+1]], dim=2)
+            key[slot_idx] = new_key[0]
+            value[slot_idx] = new_value[0]
+
+        # Replace attention mask: [0...0, 1...1(prompt_len)]
+        mask_len = attn_mask.shape[1]
+        new_mask = torch.zeros(mask_len, dtype=attn_mask.dtype, device=device)
+        new_mask[pad_len:pad_len + prompt_len] = 1
+        attn_mask[slot_idx] = new_mask
+
+        # Sample first token for new rollout from prefill logits
+        new_first_logits = first_logits[src_prompt_idx:src_prompt_idx+1]
+        new_token = self._sample_top_p(new_first_logits)
+        next_tokens[slot_idx] = new_token[0]
+
+        # Store
+        slot_rollout[slot_idx] = new_rollout_idx
+        all_tokens[new_rollout_idx, 0] = new_token[0, 0]
+        gen_lens[new_rollout_idx] = 1
+        slot_decode_step[slot_idx] = 1
+        slot_position[slot_idx] = prompt_len  # next forward will use prompt_len as position
+
+    def _pad_and_cat(self, seq_parts):
+        """Pad sequence parts to same length and concatenate."""
+        max_len = max(p.shape[1] for p in seq_parts)
+        padded = []
+        for p in seq_parts:
+            if p.shape[1] < max_len:
+                pad = torch.full(
+                    (p.shape[0], max_len - p.shape[1]),
+                    self.tokenizer.pad_token_id,
+                    dtype=p.dtype, device=p.device)
+                padded.append(torch.cat([p, pad], dim=1))
+            else:
+                padded.append(p)
+        return torch.cat(padded, dim=0)
+
+    def _generate_continuous_batching(self, prompts, mask, G, step):
+        """
+        True continuous batching: fixed batch_size slots, when a sequence
+        finishes (EOS or max_len), immediately replace that slot with the next
+        rollout by left-padding prompt KV to match current KV seq_len.
+
+        No pop/reorder_cache — batch size stays constant until all rollouts done.
+        """
+        device = prompts.device
+        B = prompts.shape[0]  # number of unique prompts (typically 1)
+        total = B * G
+        prompt_len = prompts.shape[1]
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        batch_size = min(total, getattr(self.args, 'continuous_batching_size', 8))
+        max_steps = self.max_answer_seq_len
+
+        with torch.no_grad():
+            # Prefill unique prompts once
+            out = self.actor_model.module(
+                prompts, attention_mask=mask, use_cache=True)
+            prompt_past = out.past_key_values
+            first_logits = out.logits[:, -1, :]  # [B, vocab]
+
+            # Collect all completed sequences
+            all_tokens = torch.full(
+                (total, max_steps), pad_token_id,
+                dtype=torch.long, device=device)
+            gen_lens = torch.zeros(total, dtype=torch.long, device=device)
+            completed_count = 0
+            next_rollout_idx = 0
+
+            # --- Initialize batch_size slots ---
+            init_count = min(batch_size, total)
+
+            # Expand prompt KV for initial slots
+            past = copy.deepcopy(prompt_past)
+            if B == 1:
+                past.batch_repeat_interleave(init_count)
+                init_logits = first_logits.repeat(init_count, 1)
+            else:
+                past.batch_repeat_interleave(G)
+                if init_count < B * G:
+                    past.reorder_cache(torch.arange(init_count, device=device))
+                prompt_indices = torch.arange(init_count, device=device) // G
+                init_logits = first_logits[prompt_indices]
+
+            # Per-slot state
+            slot_rollout = list(range(init_count))  # which rollout idx each slot serves
+            slot_decode_step = [0] * init_count
+            slot_position = [prompt_len] * init_count  # next position_id
+            slot_active = [True] * init_count  # False = slot is idle (no more rollouts)
+            next_rollout_idx = init_count
+
+            # Attention mask: [batch_size, prompt_len]
+            if B == 1:
+                attn_mask = mask.repeat(init_count, 1)
+            else:
+                attn_mask = mask.repeat_interleave(G, dim=0)[:init_count]
+
+            # Sample first token
+            next_tokens = self._sample_top_p(init_logits)  # [init_count, 1]
+            for i in range(init_count):
+                all_tokens[slot_rollout[i], 0] = next_tokens[i, 0]
+                gen_lens[slot_rollout[i]] = 1
+                slot_decode_step[i] = 1
+
+            # Extend attn_mask for first token
+            attn_mask = torch.cat([attn_mask, torch.ones(init_count, 1, dtype=attn_mask.dtype, device=device)], dim=1)
+
+            # Check immediate EOS
+            eos_now = (next_tokens.squeeze(1) == eos_token_id).cpu().tolist()
+            for i in range(init_count):
+                if eos_now[i]:
+                    completed_count += 1
+                    if next_rollout_idx < total:
+                        self._cb_replace_slot_inplace(
+                            i, past, prompt_past, attn_mask,
+                            first_logits, next_tokens, all_tokens, gen_lens,
+                            slot_rollout, slot_decode_step, slot_position,
+                            next_rollout_idx, prompt_len, B, device)
+                        next_rollout_idx += 1
+                    else:
+                        slot_active[i] = False
+
+            # Main decode loop
+            decode_steps = 0
+            total_active_slots = 0
+            while completed_count < total:
+                # Check if any slot is still active
+                if not any(slot_active):
+                    break
+
+                num_slots = len(slot_rollout)
+                decode_steps += 1
+                total_active_slots += num_slots
+                # Build position_ids
+                pos_ids = torch.tensor(
+                    [[slot_position[i]] for i in range(num_slots)],
+                    device=device)
+
+                # Forward pass
+                out = self.actor_model.module(
+                    next_tokens, attention_mask=attn_mask,
+                    position_ids=pos_ids,
+                    past_key_values=past, use_cache=True)
+                past = out.past_key_values
+                next_tokens = self._sample_top_p(out.logits[:, -1, :])
+
+                # Extend attention mask
+                attn_mask = torch.cat([attn_mask, torch.ones(num_slots, 1, dtype=attn_mask.dtype, device=device)], dim=1)
+
+                # Update positions and store tokens
+                for i in range(num_slots):
+                    if not slot_active[i]:
+                        continue
+                    slot_position[i] += 1
+                    ds = slot_decode_step[i]
+                    if ds < max_steps:
+                        all_tokens[slot_rollout[i], ds] = next_tokens[i, 0]
+                        gen_lens[slot_rollout[i]] = ds + 1
+                    slot_decode_step[i] += 1
+
+                # Check for finished slots
+                eos_mask = (next_tokens.squeeze(1) == eos_token_id).cpu().tolist()
+                slots_finished = []
+                for i in range(num_slots):
+                    if not slot_active[i]:
+                        continue
+                    if eos_mask[i] or slot_decode_step[i] >= max_steps:
+                        completed_count += 1
+                        # Replace slot with next rollout (or remove from batch)
+                        if next_rollout_idx < total:
+                            self._cb_replace_slot_inplace(
+                                i, past, prompt_past, attn_mask,
+                                first_logits, next_tokens, all_tokens, gen_lens,
+                                slot_rollout, slot_decode_step, slot_position,
+                                next_rollout_idx, prompt_len, B, device)
+                            next_rollout_idx += 1
+                        else:
+                            slots_finished.append(i)
+
+                # Remove finished slots with no replacement (early exit / batch compaction)
+                if slots_finished:
+                    keep = [i for i in range(num_slots) if i not in slots_finished]
+                    if not keep:
+                        break
+                    keep_t = torch.tensor(keep, device=device)
+                    next_tokens = next_tokens[keep_t]
+                    past.reorder_cache(keep_t)
+                    attn_mask = attn_mask[keep_t]
+                    # Compact per-slot state
+                    slot_rollout = [slot_rollout[i] for i in keep]
+                    slot_decode_step = [slot_decode_step[i] for i in keep]
+                    slot_position = [slot_position[i] for i in keep]
+                    slot_active = [slot_active[i] for i in keep]
+
+        # Build output: [prompt | generated]
+        max_gen = gen_lens.max().item()
+        all_tokens = all_tokens[:, :max_gen]
+        expanded_prompts = prompts.repeat_interleave(G, dim=0)
+        seq = torch.cat([expanded_prompts, all_tokens], dim=1)
+
+        # Post-processing
+        batch_size = seq.shape[0]
+        self.prompt_length = prompt_len
+        ans = seq[:, prompt_len:]
+        valid_ans_len = (ans != pad_token_id).sum(dim=-1)
+
+        self._last_seq_lengths = valid_ans_len.cpu().tolist()
+        self._last_prompt_length = prompt_len
+        self._last_total_seq_length = seq.shape[1]
+        self._last_avg_batch_size = total_active_slots / max(decode_steps, 1)
+
+        if self.args.print_answers and (step % self.args.print_answers_interval == 0):
+            print(
+                f"--- prompt --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(prompts, skip_special_tokens=True)}"
+            )
+            print(
+                f"--- ans    --> step={step}, rank={torch.distributed.get_rank()}, {self.tokenizer.batch_decode(ans, skip_special_tokens=True)}"
+            )
+
+        out_seq = []
+        for i in range(batch_size):
+            if valid_ans_len[i] <= 1:
+                print(
+                    f'Dropping too short generated answer: {step=}: \n'
+                    f'prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                    f'answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+                )
+                continue
+            else:
+                out_seq.append(seq[i:i + 1])
+
+        if not out_seq:
+            print(
+                f'All generated results are too short for rank={self.args.local_rank} step={step}\n'
+                f'-> prompts: {self.tokenizer.batch_decode(prompts, skip_special_tokens=False)}\n'
+                f'-> answers: {self.tokenizer.batch_decode(ans, skip_special_tokens=False)}'
+            )
+            return None
+
+        out_seq = torch.cat(out_seq, dim=0)
+        return out_seq
 
     def _generate_early_exit(self, prompts, mask, G, step):
         """
@@ -404,18 +720,11 @@ class DeepSpeedGRPOTrainer():
 
         logprob_start = time.time()
         with torch.no_grad():
-            output = self.actor_model(seq, attention_mask=attention_mask)
-            output_ref = self.ref_model(seq, attention_mask=attention_mask)
+            log_probs = compute_log_probs_microbatch(
+                self.actor_model, seq, attention_mask, self.compute_fp32_loss)
+            ref_log_probs = compute_log_probs_microbatch(
+                self.ref_model, seq, attention_mask, self.compute_fp32_loss)
         logprob_end = time.time()
-
-        logits = output.logits
-        logits_ref = output_ref.logits
-        if self.compute_fp32_loss:
-            logits = logits.to(torch.float)
-            logits_ref = logits_ref.to(torch.float)
-
-        log_probs = gather_log_probs(logits[:, :-1, :], seq[:, 1:])
-        ref_log_probs = gather_log_probs(logits_ref[:, :-1, :], seq[:, 1:])
 
         ans = seq[:, prompt_length:]
         actual_batch = seq.shape[0]
@@ -487,18 +796,11 @@ class DeepSpeedGRPOTrainer():
 
         logprob_start = time.time()
         with torch.no_grad():
-            output = self.actor_model(seq, attention_mask=attention_mask)
-            output_ref = self.ref_model(seq, attention_mask=attention_mask)
+            log_probs = compute_log_probs_microbatch(
+                self.actor_model, seq, attention_mask, self.compute_fp32_loss)
+            ref_log_probs = compute_log_probs_microbatch(
+                self.ref_model, seq, attention_mask, self.compute_fp32_loss)
         logprob_end = time.time()
-
-        logits = output.logits
-        logits_ref = output_ref.logits
-        if self.compute_fp32_loss:
-            logits = logits.to(torch.float)
-            logits_ref = logits_ref.to(torch.float)
-
-        log_probs = gather_log_probs(logits[:, :-1, :], seq[:, 1:])
-        ref_log_probs = gather_log_probs(logits_ref[:, :-1, :], seq[:, 1:])
 
         ans = seq[:, prompt_length:]
         actual_batch = seq.shape[0]

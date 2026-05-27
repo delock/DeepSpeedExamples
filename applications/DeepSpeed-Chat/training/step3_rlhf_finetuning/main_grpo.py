@@ -347,6 +347,20 @@ def parse_args():
         help="Custom decode loop with batch compaction: removes finished sequences "
              "from the batch on EOS. Includes shared prefix. Saves both prefill and decode padding.",
     )
+    parser.add_argument(
+        "--continuous_batching_generate",
+        action="store_true",
+        default=False,
+        help="Generational continuous batching: decode with a fixed active batch size, "
+             "replacing finished sequences with new rollouts. Enables G >> batch_size "
+             "(e.g. G=32, batch=8). Includes shared prefix + early exit.",
+    )
+    parser.add_argument(
+        "--continuous_batching_size",
+        type=int,
+        default=8,
+        help="Number of active decode slots for continuous batching (default: 8).",
+    )
 
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
@@ -483,11 +497,14 @@ def _print_step_info(trainer, args, epoch, step, training_time):
     if seq_lens:
         import numpy as np
         arr = np.array(seq_lens)
+        avg_bs = getattr(trainer, '_last_avg_batch_size', None)
+        avg_bs_str = f" | avg_batch={avg_bs:.1f}" if avg_bs is not None else ""
         print_rank_0(
             f"[SeqLen] prompt={getattr(trainer,'_last_prompt_length',0)} | "
             f"ans: min={arr.min()}, max={arr.max()}, mean={arr.mean():.1f}, std={arr.std():.1f} | "
             f"total_padded={getattr(trainer,'_last_total_seq_length',0)} | "
-            f"util={arr.mean()/(getattr(trainer,'_last_total_seq_length',1)-getattr(trainer,'_last_prompt_length',0))*100:.1f}%",
+            f"util={arr.mean()/(getattr(trainer,'_last_total_seq_length',1)-getattr(trainer,'_last_prompt_length',0))*100:.1f}%"
+            f"{avg_bs_str}",
             args.global_rank)
 
     print_rank_0(
