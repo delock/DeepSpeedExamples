@@ -304,6 +304,7 @@ class DeepSpeedGRPOTrainer():
     def _cb_replace_slot_inplace(self, slot_idx, past, prompt_past, attn_mask,
                                   first_logits, next_tokens, all_tokens, gen_lens,
                                   slot_rollout, slot_decode_step, slot_position,
+                                  slot_pad_start,
                                   new_rollout_idx, prompt_len, B, device):
         """Replace a finished slot with a new rollout by left-padding prompt KV."""
         current_kv_len = past.layers[0].keys.shape[2]
@@ -342,6 +343,7 @@ class DeepSpeedGRPOTrainer():
         gen_lens[new_rollout_idx] = 1
         slot_decode_step[slot_idx] = 1
         slot_position[slot_idx] = prompt_len  # next forward will use prompt_len as position
+        slot_pad_start[slot_idx] = pad_len
 
     def _pad_and_cat(self, seq_parts):
         """Pad sequence parts to same length and concatenate."""
@@ -410,6 +412,7 @@ class DeepSpeedGRPOTrainer():
             slot_decode_step = [0] * init_count
             slot_position = [prompt_len] * init_count  # next position_id
             slot_active = [True] * init_count  # False = slot is idle (no more rollouts)
+            slot_pad_start = [0] * init_count  # leading padding length per slot
             next_rollout_idx = init_count
 
             # Attention mask: [batch_size, prompt_len]
@@ -438,6 +441,7 @@ class DeepSpeedGRPOTrainer():
                             i, past, prompt_past, attn_mask,
                             first_logits, next_tokens, all_tokens, gen_lens,
                             slot_rollout, slot_decode_step, slot_position,
+                            slot_pad_start,
                             next_rollout_idx, prompt_len, B, device)
                         next_rollout_idx += 1
                     else:
@@ -495,6 +499,7 @@ class DeepSpeedGRPOTrainer():
                                 i, past, prompt_past, attn_mask,
                                 first_logits, next_tokens, all_tokens, gen_lens,
                                 slot_rollout, slot_decode_step, slot_position,
+                                slot_pad_start,
                                 next_rollout_idx, prompt_len, B, device)
                             next_rollout_idx += 1
                         else:
@@ -514,6 +519,22 @@ class DeepSpeedGRPOTrainer():
                     slot_decode_step = [slot_decode_step[i] for i in keep]
                     slot_position = [slot_position[i] for i in keep]
                     slot_active = [slot_active[i] for i in keep]
+                    slot_pad_start = [slot_pad_start[i] for i in keep]
+
+                # KV cache left-trim: remove common leading padding across all active slots
+                active_pads = [slot_pad_start[i] for i in range(len(slot_pad_start)) if slot_active[i]]
+                if active_pads:
+                    min_pad = min(active_pads)
+                    if min_pad >= 16:
+                        # Trim KV cache
+                        for layer_idx in range(len(past)):
+                            past.layers[layer_idx].keys = past.layers[layer_idx].keys[:, :, min_pad:]
+                            past.layers[layer_idx].values = past.layers[layer_idx].values[:, :, min_pad:]
+                        # Trim attention mask
+                        attn_mask = attn_mask[:, min_pad:]
+                        # Adjust pad_start
+                        for i in range(len(slot_pad_start)):
+                            slot_pad_start[i] -= min_pad
 
         # Build output: [prompt | generated]
         max_gen = gen_lens.max().item()
