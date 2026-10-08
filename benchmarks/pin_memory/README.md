@@ -12,6 +12,7 @@ run as root for multi-GB models.
 |--------|-----------------|-----------------|
 | [`model_tensor_offload/`](model_tensor_offload/) | ZeRO CPU param/optimizer offload (stage 3 default; `--zero-stage 1\|2` optional) | `python model_tensor_offload/bench.py --hidden 2048 --layers 12 --batch 4 --seq 128` |
 | [`activation_offload/`](activation_offload/) | Checkpoint hidden-state offload; `use_pin_memory` on/off, **async on** | `python activation_offload/bench.py --hidden 1024 --layers 8 --batch 1 --seq 2048` |
+| [`saved_activation_offload/`](saved_activation_offload/) | Credit-bounded saved MLP activation offload (no remat) | `python saved_activation_offload/bench.py --model Qwen/Qwen3-8B --offload-optimizer` |
 | [`h2d_d2h/`](h2d_d2h/) | Supporting H2D/D2H GB/s (pageable, torch, native-unregistered, native-registered) | `python h2d_d2h/bench.py` |
 | [`grad_offload/`](grad_offload/) | Optional #8207-style grad offload (wraps model-tensor ZeRO-3) | `python grad_offload/bench.py --hidden 2048 --layers 12` |
 | [`cpu_pin/`](cpu_pin/) | Optional CPU-only native vs Torch pin | `python cpu_pin/bench.py` |
@@ -29,7 +30,14 @@ run as root for multi-GB models.
 `--ablate-register` adds `pinned-unregistered`. CUDA-oriented; skip on XPU if `register_host_memory` is missing (`h2d_d2h/bench.py --skip-native-register`).
 
 ```bash
-python model_tensor_offload/bench.py --model Qwen/Qwen2.5-7B --batch 4 --seq 512
+# smoke (synthetic)
+python model_tensor_offload/bench.py --hidden 2048 --layers 12 --batch 4 --seq 128
+
+# H200 ZeRO-3 CPU offload (Qwen3 dense + Qwen3.5 hybrid; config + random weights)
+# Needs ~256 GiB host RAM for Qwen3-8B without multi-node; raise ulimit -l.
+python model_tensor_offload/bench.py --model Qwen/Qwen3-8B --batch 4 --seq 512
+python model_tensor_offload/bench.py --model Qwen/Qwen3.5-9B --batch 4 --seq 512
+
 python model_tensor_offload/bench.py --zero-stage 2 --hidden 2048 --layers 12 --batch 4 --seq 128
 ```
 

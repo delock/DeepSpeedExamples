@@ -72,3 +72,58 @@ def run_arm_subprocess(script_path, extra_args, env=None):
         print(proc.stderr[-2000:], file=sys.stderr)
         raise RuntimeError(f"arm produced no ARMRESULT (rc={proc.returncode})")
     return arm
+
+
+def param_numel(param):
+    return int(getattr(param, "ds_numel", param.numel()))
+
+
+def build_hf_causal_lm(model_id, torch_dtype):
+    """Config + random weights. Prefer text-only if the hub card is multimodal.
+
+    Skip Hugging Face ``post_init`` weight fill: under ``deepspeed.zero.Init``
+    parameters are already partitioned (local ``.shape`` can be 0), so Qwen3.5
+    ``copy_`` init and ``Embedding.weight.shape[0]`` as vocab both break.
+    """
+    import transformers
+    from transformers import AutoConfig, AutoModelForCausalLM
+    try:
+        # transformers 5.16 (Qwen3.5 pin): moved out of modeling_utils.
+        from transformers.initialization import no_init_weights
+    except ImportError:
+        from transformers.modeling_utils import no_init_weights
+
+    print(f"transformers={transformers.__version__} model_id={model_id}", flush=True)
+    config = AutoConfig.from_pretrained(model_id)
+    text_config = config
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        text_config = get_text_config() or config
+    elif getattr(config, "text_config", None) is not None:
+        text_config = config.text_config
+
+    model_type = getattr(text_config, "model_type", None) or getattr(config, "model_type", "")
+    if "moe" in str(model_type):
+        raise ValueError(f"MoE model_type {model_type!r} is out of scope for this bench")
+
+    def from_config(**extra):
+        try:
+            return AutoModelForCausalLM.from_config(text_config, dtype=torch_dtype, **extra)
+        except TypeError:
+            return AutoModelForCausalLM.from_config(text_config, torch_dtype=torch_dtype, **extra)
+
+    # Pin/offload wall time does not need pretrained-style init values.
+    with no_init_weights():
+        try:
+            model = from_config(attn_implementation="flash_attention_2")
+        except Exception as exc:
+            print(f"flash_attention_2 unavailable ({type(exc).__name__}: {exc}); default attn", flush=True)
+            model = from_config()
+
+    vocab = int(getattr(text_config, "vocab_size", 0) or getattr(config, "vocab_size", 0) or 0)
+    if vocab <= 0:
+        weight = model.get_input_embeddings().weight
+        vocab = int(getattr(weight, "ds_shape", weight.shape)[0])
+    if vocab <= 0:
+        raise ValueError(f"could not determine vocab_size for {model_id}")
+    return model, vocab, transformers.__version__, model_type

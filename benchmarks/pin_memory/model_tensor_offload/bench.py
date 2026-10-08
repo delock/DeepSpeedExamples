@@ -20,7 +20,8 @@ _PIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PIN_ROOT not in sys.path:
     sys.path.insert(0, _PIN_ROOT)
 
-from common import dist_env, patch_cpp_extension_drop_cxx17, print_arm_result, print_driver_result, run_arm_subprocess
+from common import (build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17, print_arm_result,
+                    print_driver_result, run_arm_subprocess)
 
 
 def parse_args():
@@ -72,6 +73,67 @@ def _build_synthetic(hidden, layers):
     return Net(hidden, layers), 32000
 
 
+def _cpu_bytes(tensor):
+    import torch
+    if tensor is None or not torch.is_tensor(tensor):
+        return 0
+    if tensor.device.type != "cpu":
+        return 0
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _measure_offload_gb(engine):
+    """CPU-resident param shards + optimizer/master-weight tensors after a step."""
+    seen = set()
+    param_bytes = 0
+    optim_bytes = 0
+
+    def add(bucket, tensor):
+        nonlocal param_bytes, optim_bytes
+        nbytes = _cpu_bytes(tensor)
+        if nbytes == 0:
+            return
+        key = int(tensor.data_ptr())
+        if key in seen:
+            return
+        seen.add(key)
+        if bucket == "param":
+            param_bytes += nbytes
+        else:
+            optim_bytes += nbytes
+
+    for param in engine.module.parameters():
+        add("param", getattr(param, "ds_tensor", param))
+        add("param", param)
+
+    optimizer = engine.optimizer
+    for tensor in getattr(optimizer, "fp16_partitioned_groups_flat", []) or []:
+        add("param", tensor)
+    for tensor in getattr(optimizer, "fp32_partitioned_groups_flat", []) or []:
+        add("optim", tensor)
+        add("optim", getattr(tensor, "grad", None))
+        add("optim", getattr(tensor, "exp_avg", None))
+        add("optim", getattr(tensor, "exp_avg_sq", None))
+        add("optim", getattr(tensor, "exp_avg_cpu_data", None))
+        add("optim", getattr(tensor, "exp_avg_sq_cpu_data", None))
+
+    inner = getattr(optimizer, "optimizer", optimizer)
+    state = getattr(inner, "state", None)
+    if isinstance(state, dict):
+        for group_state in state.values():
+            if not isinstance(group_state, dict):
+                continue
+            for value in group_state.values():
+                add("optim", value)
+
+    gb = 1024**3
+    return {
+        "offload_param_gb": round(param_bytes / gb, 2),
+        "offload_optim_gb": round(optim_bytes / gb, 2),
+        "offload_gb": round((param_bytes + optim_bytes) / gb, 2),
+    }
+
+
 def _zero_config(stage, pin):
     offload_optimizer = {"device": "cpu", "pin_memory": bool(pin)}
     cfg = {"stage": stage, "offload_optimizer": offload_optimizer}
@@ -89,21 +151,6 @@ def run_arm(args):
     import torch
     import deepspeed
 
-    if args.model:
-        from transformers import AutoConfig, AutoModelForCausalLM
-        config = AutoConfig.from_pretrained(args.model)
-        model = AutoModelForCausalLM.from_config(config)
-        vocab = model.get_input_embeddings().weight.shape[0]
-
-        def forward_loss(engine, ids):
-            return engine(ids).logits.sum()
-    else:
-        model, vocab = _build_synthetic(args.hidden, args.layers)
-
-        def forward_loss(engine, ids):
-            return engine(ids)
-
-    n_params = sum(p.numel() for p in model.parameters())
     ds_config = {
         "train_micro_batch_size_per_gpu": args.batch,
         "gradient_accumulation_steps": 1,
@@ -118,6 +165,30 @@ def run_arm(args):
         },
         "zero_optimization": _zero_config(args.zero_stage, args.pin),
     }
+
+    hf_transformers = None
+    hf_model_type = None
+    if args.model:
+
+        def forward_loss(engine, ids):
+            return engine(ids).logits.sum()
+
+        # Partition at construct time so H200-scale Qwen3/Qwen3.5 fit host RAM.
+        if args.zero_stage == 3:
+            with deepspeed.zero.Init(config_dict_or_path=ds_config,
+                                     dtype=torch.bfloat16,
+                                     remote_device="cpu",
+                                     pin_memory=bool(args.pin)):
+                model, vocab, hf_transformers, hf_model_type = build_hf_causal_lm(args.model, torch.bfloat16)
+        else:
+            model, vocab, hf_transformers, hf_model_type = build_hf_causal_lm(args.model, torch.bfloat16)
+    else:
+        model, vocab = _build_synthetic(args.hidden, args.layers)
+
+        def forward_loss(engine, ids):
+            return engine(ids)
+
+    n_params = sum(param_numel(p) for p in model.parameters())
 
     engine, _, _, _ = deepspeed.initialize(model=model, config=ds_config)
     dev = engine.device
@@ -141,6 +212,7 @@ def run_arm(args):
         except Exception:
             return None
 
+    offload = _measure_offload_gb(engine)
     print_arm_result({
         "experiment": "model_tensor_offload",
         "zero_stage": args.zero_stage,
@@ -148,6 +220,8 @@ def run_arm(args):
         "register": bool(args.register) if args.pin else None,
         "device": dev.type,
         "model": args.model or f"synthetic-h{args.hidden}-l{args.layers}",
+        "hf_model_type": hf_model_type,
+        "transformers": hf_transformers,
         "params_b": round(n_params / 1e9, 3),
         "batch": args.batch,
         "seq": args.seq,
@@ -156,6 +230,7 @@ def run_arm(args):
         "step_avg_s": sum(step_times) / len(step_times),
         "step_min_s": min(step_times),
         "gpu_peak_gb": _mem(dev_api.max_memory_allocated),
+        **offload,
     })
 
 
@@ -198,12 +273,15 @@ def run_driver(args):
     print(f"stage: {pinned['zero_stage']}  model: {pinned['model']}  params: {pinned['params_b']}B  "
           f"device: {pinned['device']}")
     print(f"batch: {pinned['batch']} x seq: {pinned['seq']}  ({pinned['tokens_per_step']} tokens/step)")
+    print(f"offload: params {pinned.get('offload_param_gb', 0):.2f} GB  "
+          f"optimizer {pinned.get('offload_optim_gb', 0):.2f} GB  "
+          f"total {pinned.get('offload_gb', 0):.2f} GB")
     print()
-    print(f"{'arm':<22}{'avg step (s)':>14}{'min step (s)':>14}{'GPU peak (GB)':>16}")
+    print(f"{'arm':<22}{'avg step (s)':>14}{'min step (s)':>14}{'GPU peak (GB)':>16}{'offload (GB)':>16}")
     for name, _, _ in arms:
         row = results[name]
         print(f"{name:<22}{row['step_avg_s']:>14.3f}{row['step_min_s']:>14.3f}"
-              f"{(row['gpu_peak_gb'] or 0):>16.2f}")
+              f"{(row['gpu_peak_gb'] or 0):>16.2f}{(row.get('offload_gb') or 0):>16.2f}")
     speedup = unpinned["step_avg_s"] / pinned["step_avg_s"]
     saved = unpinned["step_avg_s"] - pinned["step_avg_s"]
     tok_pin = pinned["tokens_per_step"] / pinned["step_avg_s"]
