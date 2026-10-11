@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import inspect
 import math
 import os
 import sys
@@ -21,8 +20,8 @@ _PIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PIN_ROOT not in sys.path:
     sys.path.insert(0, _PIN_ROOT)
 
-from common import (build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17, print_arm_result,
-                    print_driver_result, run_arm_subprocess)
+from common import (apply_liger, build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17,
+                    print_arm_result, print_driver_result, run_arm_subprocess)
 
 
 def parse_args():
@@ -91,45 +90,6 @@ def _enable_non_reentrant_checkpointing(model):
         model.gradient_checkpointing_enable()
     model.config.use_cache = False
     model.train()
-
-
-def _call_with_known_kwargs(fn, kwargs):
-    params = inspect.signature(fn).parameters
-    accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-    used = kwargs if accepts_var_kw else {k: v for k, v in kwargs.items() if k in params}
-    fn(**used)
-    return used
-
-
-def _apply_liger(model_id):
-    """Patch modeling classes before from_config. Returns enabled feature names."""
-    enabled = []
-    lower = (model_id or "").lower()
-    if "qwen3.5" in lower or "qwen3_5" in lower:
-        from liger_kernel.transformers import apply_liger_kernel_to_qwen3_5 as apply_fn
-        family = "qwen3_5"
-    else:
-        from liger_kernel.transformers import apply_liger_kernel_to_qwen3 as apply_fn
-        family = "qwen3"
-    # FLCE-only: rope/rms_norm/swiglu fusion left disabled. Their custom
-    # autograd.Functions stash backward tensors outside torch.autograd.graph's
-    # saved_tensors_hooks (likely via direct ctx attribute assignment rather
-    # than ctx.save_for_backward), so DeepSpeed's non_reentrant_checkpoint
-    # placeholder-swap can never discard them -- confirmed empirically to
-    # blow up per-layer forward memory (retained until backward touches it).
-    kwargs = {
-        "rope": False,
-        "rms_norm": False,
-        "swiglu": False,
-        "cross_entropy": False,
-        "fused_linear_cross_entropy": True,
-    }
-    used = _call_with_known_kwargs(apply_fn, kwargs)
-    enabled.append(f"liger_{family}")
-    if used.get("fused_linear_cross_entropy"):
-        enabled.append("liger_fused_linear_ce")
-    print(f"liger applied via {apply_fn.__name__} kwargs={sorted(used)}", flush=True)
-    return enabled
 
 
 def _install_tiled_mlp(model):
@@ -256,7 +216,7 @@ def run_arm(args):
             dist_env()
         if args.act_mem_opt:
             try:
-                act_mem_opt.extend(_apply_liger(args.model))
+                act_mem_opt.extend(apply_liger(args.model))
             except Exception as exc:
                 print(f"liger unavailable ({type(exc).__name__}: {exc})", flush=True)
 

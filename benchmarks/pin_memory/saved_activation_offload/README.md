@@ -137,3 +137,113 @@ The driver reports `pin_gap_s`, `arm_spread_s`, and `pin_separated`. Treat a
 Backward prefetch is issued without blocking, but the autograd thread still
 calls the replacement issue from inside a module backward hook, so backward
 overlap is weaker than a fully decoupled prefetcher would achieve.
+
+## Environment setup (H200, torch 2.14 + flash-attn 2.8.3)
+
+The widened whole-decoder-layer scope and `--act-mem-opt` (Liger FLCE-only)
+runs below need a C++20-built flash-attn against a `torch==2.14.0+cu130`
+install; the stock pip wheel is C++17 and will not load against that torch
+build.
+
+```bash
+# fresh conda env cloned from the pod's existing `dev` env
+conda create -y -n torch214 --clone dev
+conda activate torch214
+PY=$(command -v python3)
+
+"$PY" -m pip install --force-reinstall 'torch==2.14.0+cu130' \
+  --index-url https://download.pytorch.org/whl/cu130
+"$PY" -c 'import torch; assert torch.__version__ == "2.14.0+cu130", torch.__version__'
+
+# remove the stale (C++17) flash-attn wheel
+"$PY" -m pip uninstall -y flash-attn || true
+SITE=$("$PY" -c 'import site; print(site.getsitepackages()[0])')
+rm -f "$SITE"/flash_attn_2_cuda*.so
+rm -rf "$SITE"/flash_attn "$SITE"/flash_attn-*.dist-info
+
+# rebuild flash-attn 2.8.3 from source with -std=c++20
+export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+export MAX_JOBS=8
+export TORCH_CUDA_ARCH_LIST="9.0"   # H200
+export CXXFLAGS="${CXXFLAGS:-} -std=c++20"
+export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:-} -std=c++20"
+
+git clone --depth 1 --branch v2.8.3 \
+  https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attn-c20-v283
+sed -i 's/-std=c++17/-std=c++20/' /tmp/flash-attn-c20-v283/setup.py
+"$PY" -m pip install -U /tmp/flash-attn-c20-v283 --no-build-isolation --no-deps
+
+"$PY" -c 'import torch, flash_attn, flash_attn_2_cuda; print(torch.__version__, flash_attn.__version__)'
+```
+
+Runtime env for every sweep below:
+
+```bash
+export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"   # $REPO = .../sfc_ds_pin_memory
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+ulimit -l unlimited   # native pin mlocks host memory
+```
+
+## Repro: widened-scope sweep, seq-extrapolated discovery, k/credits ablations
+
+All runs below are Qwen3-8B, batch 1, ZeRO-2 CPU AdamW optimizer offload
+(`--offload-optimizer`), Liger FLCE-only kernels (`--act-mem-opt`), 10 steps /
+1 warmup, whole-decoder-layer scope (`--offload-modules` default). `--seq`
+32768 and above needs `--discover-calib-seqs 4096 8192` — Discovery's own
+full-residency forward pass does not fit in 139.8 GB at that scale, so its
+manifest is instead produced from two cheap small-seq discovery runs and
+linearly extrapolated; see `extrapolate_manifest()` in `bench.py` and verify
+against a direct `--seq 8192 --discover-only` manifest before trusting a new
+seqlen.
+
+```bash
+# main dataset: unlimited offload coverage per layer (k = -1)
+for SEQ in 8192 16384 32768 65536; do
+  CALIB=(); [ "$SEQ" -ge 32768 ] && CALIB=(--discover-calib-seqs 4096 8192)
+  python benchmarks/pin_memory/saved_activation_offload/bench.py \
+    --model Qwen/Qwen3-8B --batch 1 --seq "$SEQ" --offload-tensors -1 \
+    --offload-optimizer --act-mem-opt --steps 10 --warmup 1 \
+    --manifest-out "/tmp/saved-activation-widened-scope-seq${SEQ}.json" "${CALIB[@]}"
+done
+
+# k ablation: cap to top-1 tensor/layer by size (counterintuitively *raises*
+# peak HBM -- the ~20 non-selected eligible tensors/layer fall back to
+# always-resident instead of being offloaded)
+for SEQ in 8192 16384 32768 65536; do
+  CALIB=(); [ "$SEQ" -ge 32768 ] && CALIB=(--discover-calib-seqs 4096 8192)
+  python benchmarks/pin_memory/saved_activation_offload/bench.py \
+    --model Qwen/Qwen3-8B --batch 1 --seq "$SEQ" --offload-tensors 1 \
+    --offload-optimizer --act-mem-opt --steps 10 --warmup 1 \
+    --manifest-out "/tmp/saved-activation-widened-scope-k1-seq${SEQ}.json" "${CALIB[@]}"
+done
+
+# credits ablation: halve the forward credit-pool depth instead of capping
+# coverage -- this is the knob that actually bounds the resident held-group
+# staging buffer (fwd_max_held_bytes/peak HBM), independent of k
+for SEQ in 8192 16384 32768 65536; do
+  CALIB=(); [ "$SEQ" -ge 32768 ] && CALIB=(--discover-calib-seqs 4096 8192)
+  python benchmarks/pin_memory/saved_activation_offload/bench.py \
+    --model Qwen/Qwen3-8B --batch 1 --seq "$SEQ" --offload-tensors -1 --credits 1 \
+    --offload-optimizer --act-mem-opt --steps 10 --warmup 1 \
+    --manifest-out "/tmp/saved-activation-widened-scope-credits1-seq${SEQ}.json" "${CALIB[@]}"
+done
+```
+
+Matched ckpt-activation (recipe C, `activation_offload/bench.py`) baseline for
+the speed/offload-traffic/peak-HBM comparison, same seqlens:
+
+```bash
+for SEQ in 8192 16384 32768 65536; do
+  for PIN in 0 1; do
+    python benchmarks/pin_memory/activation_offload/bench.py \
+      --model Qwen/Qwen3-8B --batch 1 --seq "$SEQ" --offload-optimizer \
+      --act-mem-opt --pin "$PIN" --steps 10 --warmup 1
+  done
+done
+```
+
+Read `pin_speedup`, `host_offload_bytes`, `hbm_peak_allocated_gb`,
+`hbm_peak_reserved_gb`, `fwd_max_held_bytes`/`bwd_max_held_bytes`,
+`k_effective_max`, and `credits_n` off the `DRIVERRESULT=`/`ARMRESULT=` JSON
+lines for the sao arms; `step_avg_s`, `gpu_peak_gb`, `offload_gb` off
+ckpt-activation's.

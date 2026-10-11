@@ -29,8 +29,8 @@ _PIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PIN_ROOT not in sys.path:
     sys.path.insert(0, _PIN_ROOT)
 
-from common import (build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17, print_arm_result,
-                    print_driver_result, run_arm_subprocess)
+from common import (apply_liger, build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17,
+                    print_arm_result, print_driver_result, run_arm_subprocess)
 from credit_offload import (Credit, CreditDeadlock, CreditPool, CreditTimeout, HostBufferPool,
                             SavedIntermediateOffload, has_internal_overlap, noop_saved_tensors,
                             register_forward_hook_always, storage_identity, storages_of, tensor_signature)
@@ -47,11 +47,27 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--credits", type=int, default=2)
     parser.add_argument("--prefetch", type=int, default=2)
-    parser.add_argument("--offload-tensors", type=int, choices=(1, 2, 3), default=3)
-    parser.add_argument("--offload-modules", default=r"\.mlp$")
+    parser.add_argument("--offload-tensors", type=int, default=3,
+                        help="top-K eligible tensors per layer to offload, by size. -1 means "
+                             "no cap: offload every eligible tensor in scope (apples-to-apples "
+                             "with activation_offload's full-block discard+recompute).")
+    parser.add_argument("--offload-modules", default=r"(?:^|\.)layers\.\d+$",
+                        help="regex matched against model.named_modules() names; must match "
+                             "exactly one module per decoder layer (_resolve_scopes enforces "
+                             "this). Default brackets the whole decoder layer (self_attn+mlp+"
+                             "norms), matching the granularity activation_offload's "
+                             "gradient_checkpointing_enable() wraps.")
     parser.add_argument("--min-offload-bytes", type=int, default=1024 * 1024)
     parser.add_argument("--skip-last-layers", type=int, default=1)
     parser.add_argument("--credit-timeout-s", type=float, default=60.0)
+    parser.add_argument("--act-mem-opt",
+                        action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Liger FLCE-only kernels when --model is set, matching "
+                             "activation_offload/bench.py's --act-mem-opt env minus TiledMLP: TiledMLP's "
+                             "autograd.Function only saves the MLP's input tensor, which this benchmark's "
+                             "Discovery._pack always excludes as aliases_input, so every scope would have "
+                             "nothing eligible to offload. Not portable here; left out.")
     parser.add_argument("--offload-optimizer",
                         action="store_true",
                         help="ZeRO-2 CPU AdamW offload (params stay on GPU). HF --model only. Matches "
@@ -59,6 +75,12 @@ def parse_args():
                              "benchmark's own credit-bounded MLP-tensor offload.")
     parser.add_argument("--mode", choices=("offload", "none", "remat"), default="offload")
     parser.add_argument("--manifest-out", default=None)
+    parser.add_argument("--discover-calib-seqs", type=int, nargs=2, default=None, metavar=("LO", "HI"),
+                        help="run Discovery at these two (smaller) seqlens instead of --seq, then "
+                             "linearly extrapolate each record's shape/stride/nbytes to --seq before "
+                             "freezing the manifest. Lets Discovery's own full-residency forward (which "
+                             "must materialize every candidate tensor at once) stay cheap even when "
+                             "--seq itself would OOM a real discovery pass.")
     parser.add_argument("--n-sweep", action="store_true")
     parser.add_argument("--pin", type=int, choices=(0, 1), default=None, help="internal: single subprocess arm")
     parser.add_argument("--discover-only", action="store_true", help=argparse.SUPPRESS)
@@ -119,6 +141,11 @@ def _build_recipe(args, device):
 
     if args.offload_optimizer:
         dist_env()
+    if args.act_mem_opt:
+        try:
+            apply_liger(args.model)
+        except Exception as exc:
+            print(f"liger unavailable ({type(exc).__name__}: {exc})", flush=True)
     model, vocab, transformers_version, model_type = build_hf_causal_lm(args.model, torch.bfloat16)
     ds_engine = None
     if args.offload_optimizer:
@@ -276,7 +303,7 @@ def freeze_manifest(records, offload_tensors, skip_last_layers, layers):
             if record["storage_id"] in chosen_storages:
                 continue
             chosen_storages.append(record["storage_id"])
-            if len(chosen_storages) == offload_tensors:
+            if offload_tensors >= 0 and len(chosen_storages) == offload_tensors:
                 break
         slot_by_storage = {storage_id: slot for slot, storage_id in enumerate(chosen_storages)}
         for record in records:
@@ -296,20 +323,6 @@ def freeze_manifest(records, offload_tensors, skip_last_layers, layers):
     }, selected
 
 
-def manifest_contract(manifest):
-    ignored = {"storage_id"}
-    return {
-        "version": manifest.get("version"),
-        "layers": manifest.get("layers"),
-        "skip_last_layers": manifest.get("skip_last_layers"),
-        "offload_tensors": manifest.get("offload_tensors"),
-        "records": [{
-            key: value
-            for key, value in record.items() if key not in ignored
-        } for record in manifest["records"]],
-    }
-
-
 def manifest_bytes(manifest):
     return json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
 
@@ -317,6 +330,84 @@ def manifest_bytes(manifest):
 def load_selector(manifest):
     return {(record["layer_idx"], record["pack_index"], signature_from_json(record["signature"]))
             for record in manifest["records"] if record["selected"]}
+
+
+def _linear_fit(x0, y0, x1, y1):
+    if x1 == x0:
+        raise ValueError("calibration seqlens must differ")
+    slope = (y1 - y0) / (x1 - x0)
+    intercept = y0 - slope * x0
+    return slope, intercept
+
+
+def _extrapolate_value(x0, y0, x1, y1, x_target):
+    slope, intercept = _linear_fit(x0, y0, x1, y1)
+    return slope * x_target + intercept
+
+
+def extrapolate_manifest(manifest_lo, manifest_hi, seq_lo, seq_hi, seq_target, offload_tensors, skip_last_layers,
+                          layers, min_offload_bytes):
+    """Rescale a pair of small-seq Discovery manifests to describe seq_target.
+
+    Validated empirically (direct probes on Qwen3-8B): every seq-dependent
+    record has exactly one shape dimension equal to the discovery seqlen,
+    and shape/stride/nbytes are exact linear functions of seq for every
+    record -- including non-contiguous (transposed-view) ones, where naively
+    assuming a contiguous layout would be wrong. credit_offload.py's
+    tensor_signature() match stays untouched: a mistake here only causes a
+    miss (nothing selected), never a wrong match.
+    """
+    records_lo = {(record["layer_idx"], record["pack_index"]): record for record in manifest_lo["records"]}
+    records_hi = {(record["layer_idx"], record["pack_index"]): record for record in manifest_hi["records"]}
+    if set(records_lo) != set(records_hi):
+        only_lo = sorted(set(records_lo) - set(records_hi))[:8]
+        only_hi = sorted(set(records_hi) - set(records_lo))[:8]
+        raise RuntimeError(f"calibration manifests disagree on recorded tensors: only in lo-seq pass "
+                            f"{only_lo}, only in hi-seq pass {only_hi}")
+
+    extrapolated = []
+    for key in sorted(records_lo):
+        lo, hi = records_lo[key], records_hi[key]
+        if lo["dtype"] != hi["dtype"]:
+            raise RuntimeError(f"dtype changed between calibration seqlens for record {key}")
+        shape_lo, shape_hi = lo["shape"], hi["shape"]
+        if len(shape_lo) != len(shape_hi):
+            raise RuntimeError(f"rank changed between calibration seqlens for record {key}")
+        if lo["aliases_param"] != hi["aliases_param"] or lo["aliases_input"] != hi["aliases_input"]:
+            raise RuntimeError(f"parameter/input aliasing changed between calibration seqlens for record {key}")
+        if shape_lo == shape_hi:
+            new_shape = list(shape_lo)
+            new_stride = list(lo["stride"])
+            new_nbytes = lo["nbytes"]
+        else:
+            stride_lo, stride_hi = lo["stride"], hi["stride"]
+            new_shape = [
+                round(_extrapolate_value(seq_lo, a, seq_hi, b, seq_target)) for a, b in zip(shape_lo, shape_hi)
+            ]
+            new_stride = [
+                round(_extrapolate_value(seq_lo, a, seq_hi, b, seq_target)) for a, b in zip(stride_lo, stride_hi)
+            ]
+            new_nbytes = round(_extrapolate_value(seq_lo, lo["nbytes"], seq_hi, hi["nbytes"], seq_target))
+        device, offset = lo["signature"][3], lo["signature"][4]
+        signature = signature_to_json((tuple(new_shape), tuple(new_stride), lo["dtype"], device, offset))
+        eligible = (not lo["aliases_param"] and not lo["aliases_input"] and new_nbytes >= min_offload_bytes)
+        extrapolated.append({
+            "layer_idx": lo["layer_idx"],
+            "pack_index": lo["pack_index"],
+            "signature": signature,
+            "shape": new_shape,
+            "stride": new_stride,
+            "dtype": lo["dtype"],
+            "nbytes": new_nbytes,
+            "storage_id": lo["storage_id"],
+            "aliases_param": lo["aliases_param"],
+            "aliases_input": lo["aliases_input"],
+            "eligible": eligible,
+            "selected": False,
+            "slot": None,
+            "slot_owner": False,
+        })
+    return freeze_manifest(extrapolated, offload_tensors, skip_last_layers, layers)
 
 
 def _write_manifest(path, manifest):
@@ -402,6 +493,54 @@ def _discover(args, model, forward_loss, scopes, accelerator):
     return freeze_manifest(records, args.offload_tensors, args.skip_last_layers, args.layers)
 
 
+def _discover_via_subprocess(args, manifest_path):
+    """Ensure a frozen manifest exists at manifest_path, computed off-process.
+
+    Discovery intentionally keeps every saved-for-backward tensor resident
+    for a full, non-offloaded forward pass -- and that residency is never
+    released for the rest of a process's life (confirmed empirically: a
+    gc.collect()+empty_cache() and a ds_engine.zero_grad() right after
+    discovery both left the memory unchanged). A measured arm must never run
+    Discovery in its own process, or that residue would sit permanently
+    under its real training loop.
+    """
+    if args.discover_calib_seqs:
+        _calibrated_discover_via_subprocess(args, manifest_path)
+        return
+    script = os.path.abspath(__file__)
+    discovery_args = _passthrough(args, manifest_path) + ["--pin", "0", "--discover-only"]
+    run_arm_subprocess(script, discovery_args)
+
+
+def _calibrated_discover_via_subprocess(args, manifest_path):
+    """Discover at two cheap seqlens and linearly extrapolate to args.seq.
+
+    Lets Discovery's own full-residency forward -- which must materialize
+    every candidate tensor at once, and so scales with seq just like the
+    real training loop -- stay cheap even when args.seq itself would OOM a
+    direct discovery pass (see extrapolate_manifest).
+    """
+    seq_lo, seq_hi = args.discover_calib_seqs
+    if seq_lo == seq_hi:
+        raise ValueError("--discover-calib-seqs requires two distinct seqlens")
+    script = os.path.abspath(__file__)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path_lo = os.path.join(tmpdir, "calib-lo.json")
+        path_hi = os.path.join(tmpdir, "calib-hi.json")
+        run_arm_subprocess(
+            script, _passthrough(args, path_lo, seq_override=seq_lo) + ["--pin", "0", "--discover-only"])
+        run_arm_subprocess(
+            script, _passthrough(args, path_hi, seq_override=seq_hi) + ["--pin", "0", "--discover-only"])
+        manifest_lo = _read_manifest(path_lo)
+        manifest_hi = _read_manifest(path_hi)
+    if manifest_lo["layers"] != manifest_hi["layers"]:
+        raise RuntimeError(f"calibration manifests disagree on resolved layer count: "
+                            f"{manifest_lo['layers']} vs {manifest_hi['layers']}")
+    manifest, _ = extrapolate_manifest(manifest_lo, manifest_hi, seq_lo, seq_hi, args.seq, args.offload_tensors,
+                                        args.skip_last_layers, manifest_lo["layers"], args.min_offload_bytes)
+    _write_manifest(manifest_path, manifest)
+
+
 def run_arm(args):
     if args.mode == "none" and args.pin:
         raise ValueError("--pin has no effect without offload")
@@ -429,19 +568,34 @@ def run_arm(args):
     accelerator.set_device(0)
     device = accelerator.current_device_name()
     device_api = torch.cuda
+
+    # A measured arm never runs Discovery's forward pass itself (see
+    # _discover_via_subprocess), and this process must not build its own
+    # model/ZeRO engine on the GPU until any such child subprocess has fully
+    # exited -- otherwise this process's own resident model and the child's
+    # transient full-residency forward would compete for the same GPU memory
+    # at the same time, which is strictly worse than running discovery
+    # in-process ever was.
+    if not args.discover_only:
+        if not args.manifest_out:
+            raise ValueError("a measured arm (no --discover-only) requires --manifest-out")
+        if not os.path.exists(args.manifest_out):
+            _discover_via_subprocess(args, args.manifest_out)
+
     model, forward_loss, transformers_version, model_type, _, ds_engine = _build_recipe(args, device)
     expected_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", args.layers))
     if args.model and args.layers != expected_layers:
         args.layers = expected_layers
     scopes = _resolve_scopes(model, args.offload_modules, args.layers)
 
-    discovered, discovered_selector = _discover(args, model, forward_loss, scopes, accelerator)
-    # Discovery is a full forward with every activation resident, which is
-    # exactly what offload avoids. Its peak must not be reported as the
-    # credit-bounded loop's peak.
-    discovery_peak_gb = _max_memory(device_api, "max_memory_allocated")
-    device_api.reset_peak_memory_stats()
+    discovery_peak_gb = None
     if args.discover_only:
+        discovered, _ = _discover(args, model, forward_loss, scopes, accelerator)
+        # Discovery is a full forward with every activation resident, which is
+        # exactly what offload avoids. Its peak must not be reported as the
+        # credit-bounded loop's peak.
+        discovery_peak_gb = _max_memory(device_api, "max_memory_allocated")
+        device_api.reset_peak_memory_stats()
         if not args.manifest_out:
             raise ValueError("--discover-only requires --manifest-out")
         _write_manifest(args.manifest_out, discovered)
@@ -453,14 +607,7 @@ def run_arm(args):
         })
         return
 
-    if args.manifest_out and os.path.exists(args.manifest_out):
-        manifest = _read_manifest(args.manifest_out)
-        if manifest_contract(manifest) != manifest_contract(discovered):
-            raise RuntimeError("saved-tensor discovery signature drifted from the frozen manifest")
-    else:
-        manifest = discovered
-        if args.manifest_out:
-            _write_manifest(args.manifest_out, manifest)
+    manifest = _read_manifest(args.manifest_out)
     selector = load_selector(manifest)
     manifest_hash = hashlib.sha256(manifest_bytes(manifest)).hexdigest()
     selected_records = [record for record in manifest["records"] if record["slot_owner"]]
@@ -716,7 +863,7 @@ def run_arm(args):
     print_arm_result(result)
 
 
-def _passthrough(args, manifest_path, credits=None):
+def _passthrough(args, manifest_path, credits=None, seq_override=None):
     result = [
         "--hidden",
         str(args.hidden),
@@ -725,7 +872,7 @@ def _passthrough(args, manifest_path, credits=None):
         "--batch",
         str(args.batch),
         "--seq",
-        str(args.seq),
+        str(args.seq if seq_override is None else seq_override),
         "--steps",
         str(args.steps),
         "--warmup",
@@ -766,8 +913,8 @@ def run_driver(args):
         handle.close()
         os.unlink(manifest_path)
     try:
-        discovery_args = _passthrough(args, manifest_path) + ["--pin", "0", "--discover-only"]
-        discovery = run_arm_subprocess(script, discovery_args)
+        _discover_via_subprocess(args, manifest_path)
+        discovery = {"manifest_sha256": hashlib.sha256(manifest_bytes(_read_manifest(manifest_path))).hexdigest()}
         if args.mode != "offload":
             reference_pin = "1" if args.mode == "remat" else "0"
             result = run_arm_subprocess(script, _passthrough(args, manifest_path) + ["--pin", reference_pin])

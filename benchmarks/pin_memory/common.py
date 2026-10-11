@@ -78,6 +78,47 @@ def param_numel(param):
     return int(getattr(param, "ds_numel", param.numel()))
 
 
+def _call_with_known_kwargs(fn, kwargs):
+    import inspect
+
+    params = inspect.signature(fn).parameters
+    accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    used = kwargs if accepts_var_kw else {k: v for k, v in kwargs.items() if k in params}
+    fn(**used)
+    return used
+
+
+def apply_liger(model_id):
+    """Patch modeling classes before from_config. Returns enabled feature names."""
+    enabled = []
+    lower = (model_id or "").lower()
+    if "qwen3.5" in lower or "qwen3_5" in lower:
+        from liger_kernel.transformers import apply_liger_kernel_to_qwen3_5 as apply_fn
+        family = "qwen3_5"
+    else:
+        from liger_kernel.transformers import apply_liger_kernel_to_qwen3 as apply_fn
+        family = "qwen3"
+    # FLCE-only: rope/rms_norm/swiglu fusion left disabled. Their custom
+    # autograd.Functions stash backward tensors outside torch.autograd.graph's
+    # saved_tensors_hooks (likely via direct ctx attribute assignment rather
+    # than ctx.save_for_backward), so DeepSpeed's non_reentrant_checkpoint
+    # placeholder-swap can never discard them -- confirmed empirically to
+    # blow up per-layer forward memory (retained until backward touches it).
+    kwargs = {
+        "rope": False,
+        "rms_norm": False,
+        "swiglu": False,
+        "cross_entropy": False,
+        "fused_linear_cross_entropy": True,
+    }
+    used = _call_with_known_kwargs(apply_fn, kwargs)
+    enabled.append(f"liger_{family}")
+    if used.get("fused_linear_cross_entropy"):
+        enabled.append("liger_fused_linear_ce")
+    print(f"liger applied via {apply_fn.__name__} kwargs={sorted(used)}", flush=True)
+    return enabled
+
+
 def build_hf_causal_lm(model_id, torch_dtype):
     """Config + random weights. Prefer text-only if the hub card is multimodal.
 
