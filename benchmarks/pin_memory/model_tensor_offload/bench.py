@@ -20,8 +20,9 @@ _PIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PIN_ROOT not in sys.path:
     sys.path.insert(0, _PIN_ROOT)
 
-from common import (build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17, print_arm_result,
-                    print_driver_result, run_arm_subprocess)
+from common import (_backbone_hidden, _enable_non_reentrant_checkpointing, _install_tiled_mlp,
+                    _tiled_fused_ce_loss, apply_liger, build_hf_causal_lm, dist_env, param_numel,
+                    patch_cpp_extension_drop_cxx17, print_arm_result, print_driver_result, run_arm_subprocess)
 
 
 def parse_args():
@@ -40,6 +41,21 @@ def parse_args():
     parser.add_argument("--pin", type=int, default=None, help="internal: offload pin_memory 0/1")
     parser.add_argument("--register", type=int, default=None, help="internal: DS_PIN_MEMORY_REGISTER_DEVICE")
     parser.add_argument("--ablate-register", action="store_true")
+    parser.add_argument("--act-mem-opt",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Liger FLCE-only (fused linear cross-entropy) when --model is set. "
+                             "Default off: existing invocations are unaffected.")
+    parser.add_argument("--tiled-mlp",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="When --act-mem-opt: also wrap SwiGLU MLPs with TiledMLP. No effect "
+                             "without --act-mem-opt.")
+    parser.add_argument("--gradient-checkpointing",
+                        action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Non-reentrant gradient checkpointing. Default off: existing "
+                             "invocations are unaffected.")
     return parser.parse_args()
 
 
@@ -168,10 +184,14 @@ def run_arm(args):
 
     hf_transformers = None
     hf_model_type = None
+    act_mem_opt = []
+    use_tiled_ce = False
     if args.model:
-
-        def forward_loss(engine, ids):
-            return engine(ids).logits.sum()
+        if args.act_mem_opt:
+            try:
+                act_mem_opt.extend(apply_liger(args.model))
+            except Exception as exc:
+                print(f"liger unavailable ({type(exc).__name__}: {exc})", flush=True)
 
         # Partition at construct time so H200-scale Qwen3/Qwen3.5 fit host RAM.
         if args.zero_stage == 3:
@@ -182,6 +202,21 @@ def run_arm(args):
                 model, vocab, hf_transformers, hf_model_type = build_hf_causal_lm(args.model, torch.bfloat16)
         else:
             model, vocab, hf_transformers, hf_model_type = build_hf_causal_lm(args.model, torch.bfloat16)
+
+        if args.gradient_checkpointing:
+            _enable_non_reentrant_checkpointing(model)
+        if args.act_mem_opt:
+            if args.tiled_mlp:
+                act_mem_opt.extend(_install_tiled_mlp(model))
+            use_tiled_ce = "liger_fused_linear_ce" not in act_mem_opt
+            if use_tiled_ce:
+                act_mem_opt.append("tiled_fused_ce")
+
+        def forward_loss(engine, ids):
+            if use_tiled_ce:
+                hidden = _backbone_hidden(engine.module, ids)
+                return _tiled_fused_ce_loss(engine.module, hidden, ids)
+            return engine(input_ids=ids, labels=ids).loss
     else:
         model, vocab = _build_synthetic(args.hidden, args.layers)
 
@@ -218,6 +253,8 @@ def run_arm(args):
         "zero_stage": args.zero_stage,
         "pin_memory": bool(args.pin),
         "register": bool(args.register) if args.pin else None,
+        "act_mem_opt": act_mem_opt,
+        "gradient_checkpointing": bool(args.gradient_checkpointing),
         "device": dev.type,
         "model": args.model or f"synthetic-h{args.hidden}-l{args.layers}",
         "hf_model_type": hf_model_type,
@@ -251,6 +288,9 @@ def _passthrough(args):
         "--warmup",
         str(args.warmup),
     ]
+    extra.append("--act-mem-opt" if args.act_mem_opt else "--no-act-mem-opt")
+    extra.append("--tiled-mlp" if args.tiled_mlp else "--no-tiled-mlp")
+    extra.append("--gradient-checkpointing" if args.gradient_checkpointing else "--no-gradient-checkpointing")
     if args.model:
         extra.extend(["--model", args.model])
     return extra
@@ -276,6 +316,10 @@ def run_driver(args):
     print(f"offload: params {pinned.get('offload_param_gb', 0):.2f} GB  "
           f"optimizer {pinned.get('offload_optim_gb', 0):.2f} GB  "
           f"total {pinned.get('offload_gb', 0):.2f} GB")
+    if pinned.get("act_mem_opt"):
+        print(f"act mem opt: {', '.join(pinned['act_mem_opt'])}")
+    if pinned.get("gradient_checkpointing"):
+        print("gradient checkpointing: enabled")
     print()
     print(f"{'arm':<22}{'avg step (s)':>14}{'min step (s)':>14}{'GPU peak (GB)':>16}{'offload (GB)':>16}")
     for name, _, _ in arms:

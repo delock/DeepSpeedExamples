@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import subprocess
@@ -117,6 +118,77 @@ def apply_liger(model_id):
         enabled.append("liger_fused_linear_ce")
     print(f"liger applied via {apply_fn.__name__} kwargs={sorted(used)}", flush=True)
     return enabled
+
+
+def _enable_non_reentrant_checkpointing(model):
+    # Pack hooks only see checkpoint inputs when use_reentrant is False.
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except TypeError:
+        model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+    model.train()
+
+
+def _install_tiled_mlp(model):
+    from deepspeed.runtime.sequence_parallel.ulysses_sp import TiledMLP
+
+    patched = []
+    seen = set()
+    for module in model.modules():
+        if not (hasattr(module, "gate_proj") and hasattr(module, "up_proj") and hasattr(module, "down_proj")):
+            continue
+        cls = type(module)
+        if cls in seen:
+            continue
+        seen.add(cls)
+        inner = cls.forward
+
+        def tiled_forward(self, hidden_states, *args, _inner=inner, **kwargs):
+            x = hidden_states
+            if not hasattr(x, "dim") or x.dim() != 3:
+                return _inner(self, x, *args, **kwargs)
+            seqlen = int(x.shape[-2])
+            hidden = int(x.shape[-1])
+            num_shards = max(1, math.ceil(seqlen / max(hidden, 1)))
+            compute_params = [self.down_proj.weight, self.gate_proj.weight, self.up_proj.weight]
+
+            def mlp_forward(mod, shard):
+                return _inner(mod, shard, *args, **kwargs)
+
+            return TiledMLP.apply(mlp_forward, self, x, num_shards, compute_params)
+
+        cls.forward = tiled_forward
+        patched.append(cls.__name__)
+        print(f"tiled MLP patched {cls.__name__}", flush=True)
+    if not patched:
+        raise RuntimeError("TiledMLP: no gate/up/down MLP modules found")
+    return ["tiled_mlp:" + ",".join(patched)]
+
+
+def _tiled_fused_ce_loss(causal_lm, hidden_states, labels):
+    import torch.nn.functional as F
+    from deepspeed.runtime.sequence_parallel.ulysses_sp import TiledFusedLogitsLoss
+
+    shift_h = hidden_states[:, :-1, :].contiguous()
+    shift_y = labels[:, 1:].contiguous()
+    seqlen = int(shift_h.shape[1])
+    hidden = int(shift_h.shape[-1])
+    shards = max(1, math.ceil(seqlen / max(hidden, 1)))
+    compute_params = [causal_lm.lm_head.weight]
+
+    def loss_fn(mod, x, y):
+        logits = mod.lm_head(x)
+        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), y.reshape(-1))
+
+    return TiledFusedLogitsLoss.apply(loss_fn, causal_lm, shift_h, shift_y, None, shards, compute_params, "mean")
+
+
+def _backbone_hidden(module, ids):
+    core = getattr(module, "model", None)
+    if core is None:
+        raise RuntimeError("causal LM has no .model backbone for tiled CE")
+    return core(input_ids=ids).last_hidden_state
 
 
 def build_hf_causal_lm(model_id, torch_dtype):
