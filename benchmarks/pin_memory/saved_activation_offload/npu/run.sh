@@ -1,21 +1,22 @@
 #!/bin/bash
-# Saved-activation offload — Ascend 910B4 一键启动
-# 参数钉死（本卡 29.5 GiB 口径）：
-#   Qwen3-4B / batch 1 × seq 2048 / K=3 / --credits 1 / ZeRO-2 CPU AdamW
-# 用法：
-#   ./run.sh                          # 模型从 HF hub 下载
-#   MODEL=/path/to/Qwen3-4B ./run.sh  # 本地权重
-# 结果与日志写入 ./results/。
+# Saved-activation offload — Ascend 910B4 one-click run
+# Parameters pinned for this card (29.5 GiB usable):
+#   Qwen3-4B / batch 1 x seq 2048 / K=3 / --credits 1 / ZeRO-2 CPU AdamW
+# Usage:
+#   ./run.sh                          # model from the HF hub
+#   MODEL=/path/to/Qwen3-4B ./run.sh  # local checkpoint
+# Results and logs go to ./results/.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 MODEL="${MODEL:-Qwen/Qwen3-4B}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
-# 容器 CPU 配额（本机 42 核）显式钉 OpenMP 线程数；非容器环境可注释此行
+# Pin OpenMP threads to the container CPU quota (42 cores on this host);
+# comment out on non-container setups.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-42}"
 ulimit -l unlimited 2>/dev/null || true
 
-# conda 环境与 CANN 工具链（已激活的环境可跳过）
+# conda environment and CANN toolkit (skip if already activated)
 if [ -f ~/miniconda3/etc/profile.d/conda.sh ] && [ -z "${CONDA_PREFIX:-}" ]; then
     # shellcheck disable=SC1091
     source ~/miniconda3/etc/profile.d/conda.sh
