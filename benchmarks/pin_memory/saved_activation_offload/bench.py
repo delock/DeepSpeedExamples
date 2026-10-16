@@ -563,11 +563,11 @@ def run_arm(args):
     from deepspeed.accelerator import get_accelerator
 
     accelerator = get_accelerator()
-    if accelerator.device_name() != "cuda" or not accelerator.is_available():
-        raise RuntimeError("saved activation offload benchmark is CUDA-only; no CUDA device is available")
+    if not accelerator.is_available():
+        raise RuntimeError("saved activation offload benchmark requires an accelerator device")
     accelerator.set_device(0)
     device = accelerator.current_device_name()
-    device_api = torch.cuda
+    device_api = accelerator
 
     # A measured arm never runs Discovery's forward pass itself (see
     # _discover_via_subprocess), and this process must not build its own
@@ -784,8 +784,8 @@ def run_arm(args):
         "offload_tensors_k": args.offload_tensors,
         "offload_modules": args.offload_modules,
         "skip_last_layers": args.skip_last_layers,
-        "device": "cuda",
-        "sku": torch.cuda.get_device_name(),
+        "device": accelerator.device_name(),
+        "sku": getattr(torch, accelerator.device_name()).get_device_name(),
         "model": args.model or f"synthetic-h{args.hidden}-l{args.layers}",
         "hf_model_type": model_type,
         "transformers": transformers_version,
@@ -848,7 +848,7 @@ def run_arm(args):
     }
     if args.mode == "offload":
         if not mlp_span_mean_ms or not d2h_layer_mean_ms or not h2d_ms_total:
-            raise RuntimeError("CUDA event timing produced no positive MLP-span, D2H, or H2D observation")
+            raise RuntimeError("accelerator event timing produced no positive MLP-span, D2H, or H2D observation")
         if result["fwd_max_held"] > args.credits or result["bwd_max_held"] > args.prefetch:
             raise RuntimeError("credit cap was exceeded")
         if args.pin and not result["is_pinned_verified"]:
