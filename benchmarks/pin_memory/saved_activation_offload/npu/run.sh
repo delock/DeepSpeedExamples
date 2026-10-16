@@ -1,6 +1,6 @@
 #!/bin/bash
 # Saved-activation offload — Ascend 910B4 一键启动
-# 参数钉死（NPU 口径，H200 的 8B×seq65536 在本卡 29.5 GiB 上不可行）：
+# 参数钉死（本卡 29.5 GiB 口径）：
 #   Qwen3-4B / batch 1 × seq 2048 / K=3 / --credits 1 / ZeRO-2 CPU AdamW
 # 用法：
 #   ./run.sh                          # 模型从 HF hub 下载

@@ -114,7 +114,7 @@ def _build_synthetic(hidden, layers, device):
 
 def run_arm(args):
     # Prefer an externally selected pin backend (e.g. NPU run wrapper exports
-    # DS_PIN_MEMORY_BACKEND=torch); default remains the H200 native backend.
+    # DS_PIN_MEMORY_BACKEND=torch); default remains the native backend.
     os.environ.setdefault("DS_PIN_MEMORY_BACKEND", "native")
     os.environ["DS_PIN_MEMORY_REGISTER_DEVICE"] = "1" if args.pin else "0"
     patch_cpp_extension_drop_cxx17()

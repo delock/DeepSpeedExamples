@@ -1,6 +1,6 @@
 #!/bin/bash
 # Activation checkpoint offload (recipe C) — Ascend 910B4 一键启动
-# 参数钉死（NPU 口径；H200 行用 8B × seq 8192-65536，本卡 29.5 GiB 装不下）：
+# 参数钉死（本卡 29.5 GiB 口径）：
 #   Qwen3-4B / batch 1 × seq 8192 / ZeRO-2 CPU AdamW / liger FLCE + TiledMLP
 #   / activation offload (CheckpointHiddenStatesOffload) / --steps 10 --warmup 1
 # 用法：
@@ -14,10 +14,8 @@ MODEL="${MODEL:-Qwen/Qwen3-4B}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 # 容器 CPU 配额（本机 42 核）显式钉 OpenMP 线程数；非容器环境可注释此行
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-42}"
-# NPU 用 torch_npu 的 pin 路径：native 后端的设备注册（aclrtHostRegisterV2）在
-# 每步 ~42MB 隐藏态张量（seq 8192）上塌方（pinned 臂 2-4× 慢于 pageable）；
-# torch 后端实测正常且快于 pageable。脚本默认值仍是 native（H200 行为不变），
-# 本 run.sh 显式覆盖。
+# 本机实测 torch 后端是 NPU 上更快的 pin 路径，本 run.sh 显式选择它；
+# bench.py 里为 setdefault，默认 native 不变。
 export DS_PIN_MEMORY_BACKEND="${DS_PIN_MEMORY_BACKEND:-torch}"
 ulimit -l unlimited 2>/dev/null || true
 
