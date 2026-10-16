@@ -32,8 +32,10 @@ Disable with ``--no-act-mem-opt``.
 ## Environment setup (Ascend 910B4, CANN 8.5.1 + torch 2.10)
 
 ```bash
-conda activate cann   # torch 2.10.0+cpu + torch_npu 2.10.0.post7 + transformers 5.19.0
-source ~/Ascend/cann-8.5.1/set_env.sh
+conda activate <your-env>            # torch_npu env, e.g. torch 2.10.0+cpu + torch_npu 2.10.0.post7 + transformers 5.19.0
+source <your-cann-install>/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+ulimit -l unlimited
 ```
 
 One-click run — `npu/run.sh` pins the NPU experiment parameters (Qwen3-4B,

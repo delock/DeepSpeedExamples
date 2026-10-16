@@ -16,15 +16,19 @@ export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-42}"
 ulimit -l unlimited 2>/dev/null || true
 
-# conda environment and CANN toolkit (skip if already activated)
-if [ -f ~/miniconda3/etc/profile.d/conda.sh ] && [ -z "${CONDA_PREFIX:-}" ]; then
+# conda environment and CANN toolkit; skipped when already activated.
+# Override CONDA_ENV / CONDA_SH / CANN_SET_ENV for different setups.
+CONDA_ENV="${CONDA_ENV:-cann}"
+CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
+CANN_SET_ENV="${CANN_SET_ENV:-$HOME/Ascend/cann-8.5.1/set_env.sh}"
+if [ -f "$CONDA_SH" ] && [ -z "${CONDA_PREFIX:-}" ]; then
     # shellcheck disable=SC1091
-    source ~/miniconda3/etc/profile.d/conda.sh
-    conda activate cann
+    source "$CONDA_SH"
+    conda activate "$CONDA_ENV"
 fi
-if [ -f ~/Ascend/cann-8.5.1/set_env.sh ]; then
+if [ -f "$CANN_SET_ENV" ]; then
     # shellcheck disable=SC1091
-    source ~/Ascend/cann-8.5.1/set_env.sh
+    source "$CANN_SET_ENV"
 fi
 
 mkdir -p results
