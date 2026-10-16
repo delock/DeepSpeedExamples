@@ -113,7 +113,9 @@ def _build_synthetic(hidden, layers, device):
 
 
 def run_arm(args):
-    os.environ["DS_PIN_MEMORY_BACKEND"] = "native"
+    # Prefer an externally selected pin backend (e.g. NPU run wrapper exports
+    # DS_PIN_MEMORY_BACKEND=torch); default remains the native backend.
+    os.environ.setdefault("DS_PIN_MEMORY_BACKEND", "native")
     os.environ["DS_PIN_MEMORY_REGISTER_DEVICE"] = "1" if args.pin else "0"
     patch_cpp_extension_drop_cxx17()
 
@@ -320,7 +322,7 @@ def run_arm(args):
             torch.get_device_module(str(device).split(":")[0]).reset_peak_memory_stats()
         except Exception:
             try:
-                torch.cuda.reset_peak_memory_stats()
+                accelerator.reset_peak_memory_stats()
             except Exception:
                 pass
 
@@ -329,7 +331,7 @@ def run_arm(args):
             return round(torch.get_device_module(str(device).split(":")[0]).max_memory_allocated() / 1e9, 2)
         except Exception:
             try:
-                return round(torch.cuda.max_memory_allocated() / 1e9, 2)
+                return round(accelerator.max_memory_allocated() / 1e9, 2)
             except Exception:
                 return None
 

@@ -28,3 +28,28 @@ python bench.py --model Qwen/Qwen3.5-9B --batch 1 --seq 32768 --offload-optimize
 HF path defaults to Liger (RoPE, RMSNorm, SwiGLU, fused linear CE) plus DeepSpeed
 TiledMLP. If Liger fused CE is missing, DeepSpeed ``TiledFusedLogitsLoss`` is used.
 Disable with ``--no-act-mem-opt``.
+
+## Environment setup (Ascend 910B4, CANN 8.5.1 + torch 2.10)
+
+```bash
+conda activate <your-env>            # torch_npu env, e.g. torch 2.10.0+cpu + torch_npu 2.10.0.post7 + transformers 5.19.0
+source <your-cann-install>/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+ulimit -l unlimited
+```
+
+One-click run — `npu/run.sh` pins the NPU experiment parameters (Qwen3-4B,
+batch 1 × seq 8192, ZeRO-2 CPU AdamW, Liger fused linear CE + TiledMLP,
+10 steps / 1 warmup):
+
+```bash
+cd npu && ./run.sh                      # model from the HF hub
+cd npu && MODEL=/path/to/Qwen3-4B ./run.sh   # local checkpoint
+```
+
+Manual equivalent of the pinned parameters:
+
+```bash
+DS_PIN_MEMORY_BACKEND=torch python bench.py --model Qwen/Qwen3-4B --batch 1 \
+    --seq 8192 --offload-optimizer --act-mem-opt --steps 10 --warmup 1
+```

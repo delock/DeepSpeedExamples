@@ -184,6 +184,38 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 ulimit -l unlimited   # native pin mlocks host memory
 ```
 
+## Environment setup (Ascend 910B4, CANN 8.5.1 + torch 2.10)
+
+```bash
+conda activate <your-env>            # torch_npu env, e.g. torch 2.10.0+cpu + torch_npu 2.10.0.post7 + transformers 5.19.0
+source <your-cann-install>/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+ulimit -l unlimited
+```
+
+One-click run — `npu/run.sh` pins the NPU experiment parameters (Qwen3-4B,
+batch 1 × seq 2048, K=3, `--credits 1`, ZeRO-2 CPU AdamW):
+
+```bash
+cd npu && ./run.sh                      # model from the HF hub
+cd npu && MODEL=/path/to/Qwen3-4B ./run.sh   # local checkpoint
+```
+
+Manual equivalent of the pinned parameters:
+
+```bash
+python bench.py --model Qwen/Qwen3-4B --batch 1 --seq 2048 \
+    --offload-tensors 3 --offload-optimizer --act-mem-opt \
+    --steps 20 --warmup 5 --credits 1 \
+    --manifest-out qwen3-4b-seq2048-k3-manifest.json
+```
+
+Notes:
+
+- The usable 29.5 GiB card OOMs the full-residency discovery pass at seq 4096
+  (~27.1 GiB reserved); seq 2048 works. Qwen3-8B ZeRO-2 static state (32.8 GB)
+  exceeds the card, so NPU rows use Qwen3-4B.
+
 ## Repro: widened-scope sweep, seq-extrapolated discovery, k/credits ablations
 
 All runs below are Qwen3-8B, batch 1, ZeRO-2 CPU AdamW optimizer offload
