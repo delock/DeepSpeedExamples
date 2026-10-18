@@ -46,7 +46,7 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--credits", type=int, default=2)
-    parser.add_argument("--prefetch", type=int, default=2)
+    parser.add_argument("--prefetch", type=int, default=1)
     parser.add_argument("--offload-tensors", type=int, default=3,
                         help="top-K eligible tensors per layer to offload, by size. -1 means "
                              "no cap: offload every eligible tensor in scope (apples-to-apples "

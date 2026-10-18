@@ -49,7 +49,7 @@ python benchmarks/pin_memory/saved_activation_offload/bench.py \
   --manifest-out qwen3-8b-saved-activation-manifest.json
 ```
 
-Defaults are `N=2`, `M=2`, `K=3`, one skipped final layer, 5 warmup steps,
+Defaults are `N=2`, `M=1`, `K=3`, one skipped final layer, 5 warmup steps,
 and 20 measured steps. The normal driver runs fresh subprocesses in A/B/B/A
 order. `--n-sweep` runs `N={1,2,4}` with the same manifest. `ARMRESULT` and
 `DRIVERRESULT` lines use the shared pin-memory benchmark JSON helpers.
