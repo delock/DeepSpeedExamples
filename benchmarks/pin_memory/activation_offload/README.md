@@ -29,6 +29,29 @@ HF path defaults to Liger (RoPE, RMSNorm, SwiGLU, fused linear CE) plus DeepSpee
 TiledMLP. If Liger fused CE is missing, DeepSpeed ``TiledFusedLogitsLoss`` is used.
 Disable with ``--no-act-mem-opt``.
 
+## Environment setup (H200, CUDA)
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+ulimit -l unlimited
+```
+
+One-click run — `cuda/run.sh` pins the H200 experiment parameters (Qwen3-8B,
+batch 1 × seq 32768, ZeRO-2 CPU AdamW, Liger fused linear CE + TiledMLP,
+10 steps / 1 warmup):
+
+```bash
+cd cuda && ./run.sh                      # model from the HF hub
+cd cuda && MODEL=/path/to/Qwen3-8B ./run.sh   # local checkpoint
+```
+
+Manual equivalent of the pinned parameters:
+
+```bash
+python bench.py --model Qwen/Qwen3-8B --batch 1 \
+    --seq 32768 --offload-optimizer --act-mem-opt --steps 10 --warmup 1
+```
+
 ## Environment setup (Ascend 910B4, CANN 8.5.1 + torch 2.10)
 
 ```bash

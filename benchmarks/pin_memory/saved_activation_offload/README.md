@@ -184,6 +184,22 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 ulimit -l unlimited   # native pin mlocks host memory
 ```
 
+One-click run — `cuda/run.sh` pins the H200 experiment parameters (Qwen3-8B,
+batch 1 × seq 4096, ZeRO-2 CPU AdamW optimizer offload):
+
+```bash
+cd cuda && ./run.sh                      # model from the HF hub
+cd cuda && MODEL=/path/to/Qwen3-8B ./run.sh   # local checkpoint
+```
+
+Manual equivalent of the pinned parameters:
+
+```bash
+python benchmarks/pin_memory/saved_activation_offload/bench.py \
+    --model Qwen/Qwen3-8B --batch 1 --seq 4096 --offload-optimizer \
+    --manifest-out qwen3-8b-seq4096-manifest.json
+```
+
 ## Environment setup (Ascend 910B4, CANN 8.5.1 + torch 2.10)
 
 ```bash
