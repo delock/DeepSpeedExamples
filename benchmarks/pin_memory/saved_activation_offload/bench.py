@@ -29,8 +29,9 @@ _PIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PIN_ROOT not in sys.path:
     sys.path.insert(0, _PIN_ROOT)
 
-from common import (apply_liger, build_hf_causal_lm, dist_env, param_numel, patch_cpp_extension_drop_cxx17,
-                    print_arm_result, print_driver_result, run_arm_subprocess)
+from common import (_backbone_hidden, _tiled_fused_ce_loss, apply_liger, build_hf_causal_lm, dist_env,
+                    param_numel, patch_cpp_extension_drop_cxx17, print_arm_result, print_driver_result,
+                    run_arm_subprocess)
 from credit_offload import (Credit, CreditDeadlock, CreditPool, CreditTimeout, HostBufferPool,
                             SavedIntermediateOffload, has_internal_overlap, noop_saved_tensors,
                             register_forward_hook_always, storage_identity, storages_of, tensor_signature)
@@ -60,6 +61,12 @@ def parse_args():
     parser.add_argument("--min-offload-bytes", type=int, default=1024 * 1024)
     parser.add_argument("--skip-last-layers", type=int, default=1)
     parser.add_argument("--credit-timeout-s", type=float, default=60.0)
+    parser.add_argument("--no-tiled-ce", dest="tiled_ce", action="store_false", help=argparse.SUPPRESS)
+    parser.add_argument("--tiled-ce",
+                        action="store_true",
+                        help="Compute the LM loss with DeepSpeed TiledFusedLogitsLoss instead of "
+                             "HF's ForCausalLMLoss. Avoids materialising full fp32 logits, which "
+                             "dominates device memory for large-vocab models at long sequence length.")
     parser.add_argument("--act-mem-opt",
                         action=argparse.BooleanOptionalAction,
                         default=True,
@@ -141,6 +148,7 @@ def _build_recipe(args, device):
 
     if args.offload_optimizer:
         dist_env()
+    use_tiled_ce = bool(args.tiled_ce)
     if args.act_mem_opt:
         try:
             apply_liger(args.model)
@@ -165,6 +173,9 @@ def _build_recipe(args, device):
         ids = torch.randint(0, vocab, (args.batch, args.seq), dtype=torch.long, device=ds_engine.device)
 
         def forward_loss():
+            if use_tiled_ce:
+                core = ds_engine.module
+                return _tiled_fused_ce_loss(core, _backbone_hidden(core, ids), ids)
             return ds_engine(input_ids=ids, labels=ids).loss
     else:
         model = model.to(device=device, dtype=torch.bfloat16)
@@ -172,6 +183,8 @@ def _build_recipe(args, device):
         ids = torch.randint(0, vocab, (args.batch, args.seq), dtype=torch.long, device=device)
 
         def forward_loss():
+            if use_tiled_ce:
+                return _tiled_fused_ce_loss(model, _backbone_hidden(model, ids), ids)
             return model(input_ids=ids, labels=ids).loss
 
     return model, forward_loss, transformers_version, model_type, vocab, ds_engine
@@ -893,6 +906,7 @@ def _passthrough(args, manifest_path, credits=None, seq_override=None):
         str(args.credit_timeout_s),
         "--mode",
         args.mode,
+        "--tiled-ce" if args.tiled_ce else "--no-tiled-ce",
         "--manifest-out",
         manifest_path,
     ]
